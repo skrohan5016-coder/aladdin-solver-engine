@@ -68,7 +68,7 @@ const (
 )
 
 // BestRoute finds the highest-output path from sellToken to buyToken for the
-// given input amount, searching direct pools then two-hop paths.
+// given input amount, searching direct pools then every bounded two-hop pair.
 func (g *Graph) BestRoute(sellToken, buyToken string, amountIn *big.Int) *Route {
 	sellToken, buyToken = strings.ToLower(sellToken), strings.ToLower(buyToken)
 	if sellToken == buyToken || amountIn == nil || amountIn.Sign() <= 0 {
@@ -85,12 +85,11 @@ func (g *Graph) BestRoute(sellToken, buyToken string, amountIn *big.Int) *Route 
 		if err != nil {
 			continue
 		}
-		cand := &Route{
+		best = better(best, &Route{
 			Hops: []Hop{{Pool: p, TokenIn: sellToken, TokenOut: buyToken, AmountIn: amountIn, Out: out}},
 			Out:  out,
 			Gas:  p.GasEstimate,
-		}
-		best = better(best, cand)
+		})
 	}
 
 	// --- two hop ---
@@ -98,48 +97,34 @@ func (g *Graph) BestRoute(sellToken, buyToken string, amountIn *big.Int) *Route 
 		if mid == sellToken || mid == buyToken {
 			continue
 		}
-		var leg1 *Hop
-		for _, p := range g.poolsFor(sellToken) {
-			if !p.Supports(sellToken, mid) {
+		for _, first := range g.poolsFor(sellToken) {
+			if !first.Supports(sellToken, mid) {
 				continue
 			}
-			out, err := p.QuoteExactInPair(sellToken, mid, amountIn)
+			midAmount, err := first.QuoteExactInPair(sellToken, mid, amountIn)
 			if err != nil {
 				continue
 			}
-			candidate := &Hop{Pool: p, TokenIn: sellToken, TokenOut: mid, AmountIn: amountIn, Out: out}
-			if betterHop(leg1, candidate) == candidate {
-				leg1 = candidate
+			for _, second := range g.poolsFor(mid) {
+				// Reusing one stateful pool would require applying the first swap's
+				// reserve/tick transition before quoting the second.
+				if second == first || !second.Supports(mid, buyToken) {
+					continue
+				}
+				out, err := second.QuoteExactInPair(mid, buyToken, midAmount)
+				if err != nil {
+					continue
+				}
+				best = better(best, &Route{
+					Hops: []Hop{
+						{Pool: first, TokenIn: sellToken, TokenOut: mid, AmountIn: amountIn, Out: midAmount},
+						{Pool: second, TokenIn: mid, TokenOut: buyToken, AmountIn: midAmount, Out: out},
+					},
+					Out: out,
+					Gas: first.GasEstimate + second.GasEstimate,
+				})
 			}
 		}
-		if leg1 == nil {
-			continue
-		}
-		var leg2 *Hop
-		for _, p := range g.poolsFor(mid) {
-			// Quoting the same stateful pool twice without applying the first
-			// swap's state transition is not a valid route simulation.
-			if p == leg1.Pool || !p.Supports(mid, buyToken) {
-				continue
-			}
-			out, err := p.QuoteExactInPair(mid, buyToken, leg1.Out)
-			if err != nil {
-				continue
-			}
-			candidate := &Hop{Pool: p, TokenIn: mid, TokenOut: buyToken, AmountIn: leg1.Out, Out: out}
-			if betterHop(leg2, candidate) == candidate {
-				leg2 = candidate
-			}
-		}
-		if leg2 == nil {
-			continue
-		}
-		cand := &Route{
-			Hops: []Hop{*leg1, *leg2},
-			Out:  leg2.Out,
-			Gas:  leg1.Pool.GasEstimate + leg2.Pool.GasEstimate,
-		}
-		best = better(best, cand)
 	}
 	return best
 }
@@ -150,25 +135,6 @@ func (g *Graph) poolsFor(token string) []*amm.Pool {
 		return pools[:maxPoolsPerToken]
 	}
 	return pools
-}
-
-func betterHop(a, b *Hop) *Hop {
-	if a == nil {
-		return b
-	}
-	if b == nil {
-		return a
-	}
-	if cmp := b.Out.Cmp(a.Out); cmp != 0 {
-		if cmp > 0 {
-			return b
-		}
-		return a
-	}
-	if hopKey(b) < hopKey(a) {
-		return b
-	}
-	return a
 }
 
 func better(a, b *Route) *Route {
