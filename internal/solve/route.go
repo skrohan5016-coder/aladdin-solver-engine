@@ -35,11 +35,11 @@ func NewGraph(pools []*amm.Pool) *Graph {
 	g := &Graph{byToken: map[string][]*amm.Pool{}}
 	count := map[string]int{}
 	for _, p := range pools {
-		a, b := strings.ToLower(p.TokenA), strings.ToLower(p.TokenB)
-		g.byToken[a] = append(g.byToken[a], p)
-		g.byToken[b] = append(g.byToken[b], p)
-		count[a]++
-		count[b]++
+		for _, t := range p.AllTokens() {
+			t = strings.ToLower(t)
+			g.byToken[t] = append(g.byToken[t], p)
+			count[t]++
+		}
 	}
 	for tok, n := range count {
 		if n >= 2 {
@@ -77,10 +77,10 @@ func (g *Graph) BestRoute(sellToken, buyToken string, amountIn *big.Int) *Route 
 
 	// --- direct ---
 	for _, p := range g.poolsFor(sellToken) {
-		if !strings.EqualFold(p.Other(sellToken), buyToken) {
+		if !p.Supports(sellToken, buyToken) {
 			continue
 		}
-		out, err := p.QuoteExactIn(sellToken, amountIn)
+		out, err := p.QuoteExactInPair(sellToken, buyToken, amountIn)
 		if err != nil {
 			continue
 		}
@@ -99,10 +99,10 @@ func (g *Graph) BestRoute(sellToken, buyToken string, amountIn *big.Int) *Route 
 		}
 		var leg1 *Hop
 		for _, p := range g.poolsFor(sellToken) {
-			if !strings.EqualFold(p.Other(sellToken), mid) {
+			if !p.Supports(sellToken, mid) {
 				continue
 			}
-			out, err := p.QuoteExactIn(sellToken, amountIn)
+			out, err := p.QuoteExactInPair(sellToken, mid, amountIn)
 			if err != nil {
 				continue
 			}
@@ -115,10 +115,10 @@ func (g *Graph) BestRoute(sellToken, buyToken string, amountIn *big.Int) *Route 
 		}
 		var leg2 *Hop
 		for _, p := range g.poolsFor(mid) {
-			if !strings.EqualFold(p.Other(mid), buyToken) {
+			if !p.Supports(mid, buyToken) {
 				continue
 			}
-			out, err := p.QuoteExactIn(mid, leg1.Out)
+			out, err := p.QuoteExactInPair(mid, buyToken, leg1.Out)
 			if err != nil {
 				continue
 			}
