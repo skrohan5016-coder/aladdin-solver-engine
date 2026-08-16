@@ -1,9 +1,0 @@
-	// stable
-	AmplificationParameter string `json:"amplificationParameter,omitempty"`
-
-	// concentratedLiquidity
-	SqrtPrice    string            `json:"sqrtPrice,omitempty"`
-	Liquidity    string            `json:"liquidity,omitempty"`
-	Tick         *int32            `json:"tick,omitempty"`
-	LiquidityNet map[string]string `json:"liquidityNet,omitempty"`
-}
