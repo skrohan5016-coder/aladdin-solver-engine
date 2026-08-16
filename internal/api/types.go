@@ -74,6 +74,9 @@ type Liquidity struct {
 	Fee    string          `json:"fee"`
 	Router string          `json:"router,omitempty"`
 
+	// stable
+	AmplificationParameter string `json:"amplificationParameter,omitempty"`
+
 	// concentratedLiquidity
 	SqrtPrice    string            `json:"sqrtPrice,omitempty"`
 	Liquidity    string            `json:"liquidity,omitempty"`
