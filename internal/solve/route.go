@@ -1,6 +1,7 @@
 package solve
 
 import (
+	"context"
 	"math/big"
 	"sort"
 	"strings"
@@ -33,33 +34,33 @@ type Graph struct {
 }
 
 func NewGraph(pools []*amm.Pool) *Graph {
-	g := &Graph{byToken: map[string][]*amm.Pool{}}
+	graph := &Graph{byToken: map[string][]*amm.Pool{}}
 	count := map[string]int{}
-	for _, p := range pools {
-		for _, token := range p.AllTokens() {
+	for _, pool := range pools {
+		for _, token := range pool.AllTokens() {
 			token = strings.ToLower(token)
-			g.byToken[token] = append(g.byToken[token], p)
+			graph.byToken[token] = append(graph.byToken[token], pool)
 			count[token]++
 		}
 	}
 	for token, n := range count {
 		if n >= 2 {
-			g.intermediates = append(g.intermediates, token)
+			graph.intermediates = append(graph.intermediates, token)
 		}
 	}
 	// Map iteration is deliberately removed from the final ordering. Equal
 	// connectivity is broken lexicographically so replay is deterministic.
-	sort.Slice(g.intermediates, func(i, j int) bool {
-		left, right := g.intermediates[i], g.intermediates[j]
+	sort.Slice(graph.intermediates, func(i, j int) bool {
+		left, right := graph.intermediates[i], graph.intermediates[j]
 		if count[left] != count[right] {
 			return count[left] > count[right]
 		}
 		return left < right
 	})
-	if len(g.intermediates) > maxIntermediates {
-		g.intermediates = g.intermediates[:maxIntermediates]
+	if len(graph.intermediates) > maxIntermediates {
+		graph.intermediates = graph.intermediates[:maxIntermediates]
 	}
-	return g
+	return graph
 }
 
 const (
@@ -67,37 +68,56 @@ const (
 	maxPoolsPerToken = 24
 )
 
-// BestRoute finds the highest-output path from sellToken to buyToken for the
-// given input amount, searching direct pools then every bounded two-hop pair.
+// BestRoute is the context-free helper used by focused math tests.
 func (g *Graph) BestRoute(sellToken, buyToken string, amountIn *big.Int) *Route {
+	route, _ := g.BestRouteContext(context.Background(), sellToken, buyToken, amountIn)
+	return route
+}
+
+// BestRouteContext finds the highest-output path while observing the auction
+// deadline between every bounded quote. Individual pool quotes are themselves
+// bounded by their arithmetic iteration limits.
+func (g *Graph) BestRouteContext(ctx context.Context, sellToken, buyToken string, amountIn *big.Int) (*Route, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	sellToken, buyToken = strings.ToLower(sellToken), strings.ToLower(buyToken)
 	if sellToken == buyToken || amountIn == nil || amountIn.Sign() <= 0 {
-		return nil
+		return nil, nil
 	}
 	var best *Route
 
 	// --- direct ---
-	for _, p := range g.poolsFor(sellToken) {
-		if !p.Supports(sellToken, buyToken) {
+	for _, pool := range g.poolsFor(sellToken) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if !pool.Supports(sellToken, buyToken) {
 			continue
 		}
-		out, err := p.QuoteExactInPair(sellToken, buyToken, amountIn)
+		out, err := pool.QuoteExactInPair(sellToken, buyToken, amountIn)
 		if err != nil {
 			continue
 		}
 		best = better(best, &Route{
-			Hops: []Hop{{Pool: p, TokenIn: sellToken, TokenOut: buyToken, AmountIn: amountIn, Out: out}},
+			Hops: []Hop{{Pool: pool, TokenIn: sellToken, TokenOut: buyToken, AmountIn: amountIn, Out: out}},
 			Out:  out,
-			Gas:  p.GasEstimate,
+			Gas:  pool.GasEstimate,
 		})
 	}
 
 	// --- two hop ---
 	for _, mid := range g.intermediates {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if mid == sellToken || mid == buyToken {
 			continue
 		}
 		for _, first := range g.poolsFor(sellToken) {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			if !first.Supports(sellToken, mid) {
 				continue
 			}
@@ -106,6 +126,9 @@ func (g *Graph) BestRoute(sellToken, buyToken string, amountIn *big.Int) *Route 
 				continue
 			}
 			for _, second := range g.poolsFor(mid) {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
 				// Reusing one stateful pool would require applying the first swap's
 				// reserve/tick transition before quoting the second.
 				if second == first || !second.Supports(mid, buyToken) {
@@ -126,7 +149,7 @@ func (g *Graph) BestRoute(sellToken, buyToken string, amountIn *big.Int) *Route 
 			}
 		}
 	}
-	return best
+	return best, nil
 }
 
 func (g *Graph) poolsFor(token string) []*amm.Pool {
@@ -162,15 +185,15 @@ func better(a, b *Route) *Route {
 	return a
 }
 
-func hopKey(h *Hop) string {
-	return h.Pool.Kind + "\x00" + h.Pool.ID + "\x00" + h.TokenIn + "\x00" + h.TokenOut
+func hopKey(hop *Hop) string {
+	return hop.Pool.Kind + "\x00" + hop.Pool.ID + "\x00" + hop.TokenIn + "\x00" + hop.TokenOut
 }
 
 func routeKey(route *Route) string {
-	var b strings.Builder
+	var builder strings.Builder
 	for _, hop := range route.Hops {
-		b.WriteString(hopKey(&hop))
-		b.WriteByte('\x00')
+		builder.WriteString(hopKey(&hop))
+		builder.WriteByte('\x00')
 	}
-	return b.String()
+	return builder.String()
 }

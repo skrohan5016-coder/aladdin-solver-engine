@@ -1,5 +1,5 @@
-// Command report reads the recorder's JSONL output and prints the numbers that
-// decide whether this solver is ready for a longer shadow trial.
+// Command report reads recorder JSONL output and prints the numbers that decide
+// whether this solver is ready for a longer shadow trial.
 package main
 
 import (
@@ -26,6 +26,7 @@ type auctionRecord struct {
 		DroppedNoRoute          int            `json:"droppedNoRoute"`
 		DroppedLimit            int            `json:"droppedLimitPrice"`
 		DroppedNotProfitable    int            `json:"droppedNotProfitable"`
+		CandidateSolutions      int            `json:"candidateSolutions"`
 		Solutions               int            `json:"solutions"`
 	} `json:"stats"`
 }
@@ -76,17 +77,18 @@ func main() {
 	}
 
 	var (
-		withSolution, totalOrders, totalSolutions int
-		cows, routes                              int
-		unsupported, noRoute, limit, unprofitable int
-		latencies                                 []int64
-		skipped                                   = map[string]int{}
+		withSolution, totalOrders, totalCandidates, totalSolutions int
+		cows, routes                                             int
+		unsupported, noRoute, limit, unprofitable                int
+		latencies                                                []int64
+		skipped                                                  = map[string]int{}
 	)
 	for _, record := range records {
 		if record.Stats.Solutions > 0 {
 			withSolution++
 		}
 		totalOrders += record.Stats.Orders
+		totalCandidates += record.Stats.CandidateSolutions
 		totalSolutions += record.Stats.Solutions
 		cows += record.Stats.CoWMatches
 		routes += record.Stats.BaselineRoutes
@@ -102,15 +104,15 @@ func main() {
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
 
 	n := len(records)
-	p50 := latencies[len(latencies)/2]
-	p95 := latencies[(len(latencies)-1)*95/100]
 	fmt.Printf("Auctions seen        %d\n", n)
 	fmt.Printf("Coverage             %d (%.1f%%) produced at least one solution\n", withSolution, pct(withSolution, n))
-	fmt.Printf("Solve latency        p50 %dms  p95 %dms  max %dms\n", p50, p95, latencies[len(latencies)-1])
+	fmt.Printf("Solve latency        p50 %dms  p95 %dms  max %dms\n",
+		percentile(latencies, 50), percentile(latencies, 95), latencies[len(latencies)-1])
 	fmt.Println()
 
 	fmt.Printf("Eligible orders      %d\n", totalOrders)
-	fmt.Printf("Solutions proposed   %d  (CoW matches %d, routed %d)\n", totalSolutions, cows, routes)
+	fmt.Printf("Candidates accepted  %d  (CoW matches %d, routed %d)\n", totalCandidates, cows, routes)
+	fmt.Printf("Solutions returned   %d\n", totalSolutions)
 	fmt.Println()
 
 	fmt.Println("Why orders were dropped")
@@ -122,7 +124,7 @@ func main() {
 	fmt.Println()
 
 	if len(skipped) > 0 {
-		fmt.Println("Liquidity kinds skipped or malformed (most common first)")
+		fmt.Println("Liquidity skipped or malformed (most common first)")
 		type entry struct {
 			kind  string
 			count int
@@ -138,7 +140,7 @@ func main() {
 			return list[i].kind < list[j].kind
 		})
 		for _, item := range list {
-			fmt.Printf("  %-22s %d pools\n", item.kind, item.count)
+			fmt.Printf("  %-22s %d\n", item.kind, item.count)
 		}
 		fmt.Println()
 	}
@@ -174,6 +176,21 @@ func pct(a, b int) float64 {
 		return 0
 	}
 	return float64(a) * 100 / float64(b)
+}
+
+// percentile uses the nearest-rank definition on an ascending slice.
+func percentile(sorted []int64, percent int) int64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	if percent <= 0 {
+		return sorted[0]
+	}
+	if percent >= 100 {
+		return sorted[len(sorted)-1]
+	}
+	rank := (percent*len(sorted) + 99) / 100
+	return sorted[rank-1]
 }
 
 type lineFn func(path string, line int, data []byte) error

@@ -1,5 +1,5 @@
 // Package api contains the wire types for the CoW Protocol solver-engine
-// interface, as defined by cowprotocol/services crates/solvers/openapi.yml.
+// interface, as defined by the pinned cowprotocol/services contract.
 //
 // All token amounts are canonical base-10 uint256 strings. They are never
 // parsed into floats anywhere in this codebase.
@@ -148,6 +148,7 @@ type Notification struct {
 }
 
 func (n *Notification) UnmarshalJSON(data []byte) error {
+	*n = Notification{}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(data, &fields); err != nil {
 		return err

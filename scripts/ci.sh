@@ -1,13 +1,7 @@
 #!/usr/bin/env bash
-#
-# Every gate this project enforces, in one place.
-#
-# Run it locally, from a git hook, or from GitHub Actions. Keeping the gates in
-# this script prevents local and hosted validation from drifting apart.
-#
-#   bash scripts/ci.sh
-#
+# Every gate this project enforces, shared by local development and Actions.
 set -uo pipefail
+export GOTOOLCHAIN=local
 
 cd "$(dirname "$0")/.." || exit 1
 
@@ -42,19 +36,44 @@ else
   fail "gofmt would rewrite files"
 fi
 
+section "Module contract"
+run_gate "go.mod is tidy" go mod tidy -diff
+modules="$(go list -m all 2>/dev/null || true)"
+module_count="$(printf '%s\n' "$modules" | sed '/^$/d' | wc -l | tr -d ' ')"
+if [ "$module_count" = "1" ]; then
+  pass "only the repository module is present"
+else
+  printf '%s\n' "$modules"
+  fail "third-party Go modules are present"
+fi
+if grep -qx 'go 1.24.13' go.mod; then
+  pass "Go patch version is pinned"
+else
+  fail "go.mod must pin go 1.24.13"
+fi
+
 section "Static analysis"
 run_gate "go vet" go vet ./...
 
 section "Tests"
-run_gate "go test" go test ./...
-run_gate "go test -race" go test -race ./...
+run_gate "go test" go test -count=1 ./...
+run_gate "go test -race" go test -race -count=1 ./...
 
 section "Build"
-run_gate "solver and report build" go build ./cmd/solver ./cmd/report
+run_gate "solver and report build" go build -trimpath ./cmd/solver ./cmd/report
+if grep -q '^FROM golang:1.24.13-alpine3.22@sha256:3641e0d9b931dc4f2f185dcd669c4679670e9277c8166a838ddb98a2d4389cb5 AS build$' Dockerfile &&
+  grep -q '^FROM scratch$' Dockerfile; then
+  pass "container bases are immutable"
+else
+  fail "Dockerfile must use the reviewed Go digest and scratch runtime"
+fi
+if command -v docker >/dev/null 2>&1; then
+  run_gate "network-isolated container build" docker build --network=none -t aladdin-solver-engine:ci .
+else
+  pass "Docker unavailable; immutable Dockerfile contract checked statically"
+fi
 
 section "Dependency boundary"
-# This service parses auction payloads from an external driver. Every
-# third-party module is another parser in that path, so there are none.
 if [ -f go.sum ] && [ -s go.sum ]; then
   printf '%s\n' "go.sum is non-empty — a third-party dependency was added"
   fail "stdlib-only dependency boundary"
@@ -63,21 +82,50 @@ else
 fi
 
 section "Shadow boundary"
-# The engine proposes settlements. It must never be able to sign or send one.
-pattern='PrivateKey|privateKey|mnemonic|MNEMONIC|SignTx|SendTransaction|eth_sendRawTransaction'
-hits="$(grep -rInE "$pattern" --include='*.go' . 2>/dev/null || true)"
-if [ -z "$hits" ]; then
+secret_pattern='PrivateKey|privateKey|mnemonic|MNEMONIC|SignTx|SendTransaction|eth_sendRawTransaction'
+secret_hits="$(grep -rInE "$secret_pattern" --include='*.go' --exclude='*_test.go' . 2>/dev/null || true)"
+if [ -z "$secret_hits" ]; then
   pass "no key, signing, or submission paths"
 else
-  printf '%s\n' "$hits"
+  printf '%s\n' "$secret_hits"
   fail "signing or submission path found"
 fi
 
-section "Workflow placement"
-if [ -f .github/workflows/ci.yml ]; then
-  pass "root GitHub Actions workflow present"
+outbound_pattern='http\.(Client|DefaultClient|Transport|NewRequest|Get|Post|PostForm)|net\.Dial|DialContext|tls\.Dial|rpc\.Dial|exec\.Command|"os/exec"|ethclient|websocket'
+outbound_hits="$(grep -rInE "$outbound_pattern" --include='*.go' --exclude='*_test.go' . 2>/dev/null || true)"
+if [ -z "$outbound_hits" ]; then
+  pass "no outbound client or process-execution path"
 else
-  fail "missing .github/workflows/ci.yml"
+  printf '%s\n' "$outbound_hits"
+  fail "outbound client or process-execution path found"
+fi
+
+section "Workflow and pin placement"
+misplaced="$(find . -type f -path '*/.github/workflows/*' ! -path './.github/workflows/*' -print)"
+if [ -z "$misplaced" ] && [ -f .github/workflows/ci.yml ]; then
+  pass "only root GitHub Actions workflows are active"
+else
+  printf '%s\n' "$misplaced"
+  fail "workflow is missing or misplaced"
+fi
+if grep -q 'actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09' .github/workflows/ci.yml &&
+  grep -q 'actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16' .github/workflows/ci.yml; then
+  pass "GitHub Actions are pinned by commit"
+else
+  fail "GitHub Actions must be pinned by reviewed commit"
+fi
+if grep -q '20b3a62f222ad278502fb7e85cae4938e7f26f65' UPSTREAM.md; then
+  pass "upstream solver contract is pinned"
+else
+  fail "missing upstream solver-contract pin"
+fi
+
+section "Deployment boundary"
+if grep -q 'LISTEN_ADDR=127.0.0.1:8000' deploy/solver.service &&
+  grep -q 'IPAddressDeny=any' deploy/solver.service; then
+  pass "deployment is loopback-only with external egress denied"
+else
+  fail "deployment network boundary is not enforced"
 fi
 
 section "Result"

@@ -39,6 +39,24 @@ func TestNotificationPreservesUnknownMetadata(t *testing.T) {
 	}
 }
 
+func TestNotificationUnmarshalReplacesPreviousState(t *testing.T) {
+	notification := Notification{
+		AuctionID:  "old",
+		SolutionID: 9,
+		Kind:       "old",
+		Extra:      map[string]json.RawMessage{"stale": json.RawMessage(`true`)},
+	}
+	if err := json.Unmarshal([]byte(`{"auctionId":"new","kind":"success"}`), &notification); err != nil {
+		t.Fatal(err)
+	}
+	if notification.AuctionID != "new" || notification.SolutionID != 0 || notification.Kind != "success" {
+		t.Fatalf("old core state survived unmarshal: %+v", notification)
+	}
+	if _, ok := notification.Extra["stale"]; ok {
+		t.Fatalf("old extension state survived unmarshal: %+v", notification.Extra)
+	}
+}
+
 func TestInteractionIDMustBeDecimal(t *testing.T) {
 	valid := Interaction{
 		Kind: "liquidity", ID: "7", InputToken: "0xa", OutputToken: "0xb",

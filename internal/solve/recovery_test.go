@@ -3,6 +3,7 @@ package solve
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"math/big"
 	"testing"
 
@@ -77,6 +78,18 @@ func TestMalformedFeeIsSkipped(t *testing.T) {
 	}
 }
 
+func TestPoolResourceLimitIsReported(t *testing.T) {
+	liquidity := []api.Liquidity{
+		cpPool("1", tokA, tokB, "1000000", "1000000"),
+		cpPool("2", tokA, tokB, "1000000", "1000000"),
+		cpPool("3", tokA, tokB, "1000000", "1000000"),
+	}
+	pools, skipped := BuildPoolsContext(context.Background(), liquidity, 2)
+	if len(pools) != 2 || skipped["resourceLimit"] != 1 {
+		t.Fatalf("pool limit not enforced: pools=%d skipped=%v", len(pools), skipped)
+	}
+}
+
 func TestEqualOutputRouteTieIsDeterministic(t *testing.T) {
 	pool := func(id string) *amm.Pool {
 		return &amm.Pool{
@@ -91,5 +104,52 @@ func TestEqualOutputRouteTieIsDeterministic(t *testing.T) {
 		if route == nil || route.Hops[0].Pool.ID != "1" {
 			t.Fatalf("non-deterministic tie break on iteration %d: %+v", i, route)
 		}
+	}
+}
+
+func TestRoutingObservesCancelledContext(t *testing.T) {
+	pool := &amm.Pool{
+		ID: "1", Kind: "constantProduct", TokenA: tokA, TokenB: tokB,
+		ReserveA: big.NewInt(1_000_000), ReserveB: big.NewInt(1_000_000),
+		FeeNum: big.NewInt(3), FeeDen: big.NewInt(1000), GasEstimate: 90_000,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	route, err := NewGraph([]*amm.Pool{pool}).BestRouteContext(ctx, tokA, tokB, big.NewInt(1000))
+	if route != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("route=%v err=%v, want context cancellation", route, err)
+	}
+}
+
+func TestCancellationIsNotCountedAsNoRoute(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	order := sellOrder("cancelled", tokA, tokB, "1000", "1")
+	result := Solve(ctx, &api.Auction{
+		Orders:            []api.Order{order},
+		Liquidity:         []api.Liquidity{cpPool("1", tokA, tokB, "1000000", "1000000")},
+		EffectiveGasPrice: "1",
+	}, DefaultConfig())
+	if result.Stats.DroppedNoRoute != 0 || result.Stats.CandidateSolutions != 0 {
+		t.Fatalf("cancellation was misclassified: %+v", result.Stats)
+	}
+}
+
+func TestCandidateCountIsRecordedBeforeReturnCap(t *testing.T) {
+	orders := []api.Order{
+		sellOrder("1", tokA, tokB, "1000", "1"),
+		sellOrder("2", tokA, tokB, "1000", "1"),
+		sellOrder("3", tokA, tokB, "1000", "1"),
+	}
+	cfg := DefaultConfig()
+	cfg.RequireProfitable = false
+	cfg.MaxSolutions = 1
+	result := Solve(context.Background(), &api.Auction{
+		Orders:            orders,
+		Liquidity:         []api.Liquidity{cpPool("1", tokA, tokB, "1000000", "1000000")},
+		EffectiveGasPrice: "1",
+	}, cfg)
+	if result.Stats.CandidateSolutions != 3 || result.Stats.Solutions != 1 || len(result.Solutions) != 1 {
+		t.Fatalf("candidate/return cap mismatch: %+v", result)
 	}
 }

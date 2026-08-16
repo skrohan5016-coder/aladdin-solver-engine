@@ -24,6 +24,8 @@ type Config struct {
 	MaxSolutions int
 	// MaxOrders caps how many eligible orders are considered.
 	MaxOrders int
+	// MaxPools caps how many supplied liquidity entries are parsed.
+	MaxPools int
 }
 
 func DefaultConfig() Config {
@@ -33,6 +35,7 @@ func DefaultConfig() Config {
 		RequireProfitable:     true,
 		MaxSolutions:          40,
 		MaxOrders:             250,
+		MaxPools:              2_048,
 	}
 }
 
@@ -48,6 +51,7 @@ type Stats struct {
 	DroppedNoRoute          int            `json:"droppedNoRoute"`
 	DroppedLimit            int            `json:"droppedLimitPrice"`
 	DroppedNotProfitable    int            `json:"droppedNotProfitable"`
+	CandidateSolutions      int            `json:"candidateSolutions"`
 	Solutions               int            `json:"solutions"`
 }
 
@@ -59,15 +63,18 @@ type Result struct {
 // Solve produces solutions for an auction. It never signs, submits, or touches
 // funds; it returns proposed settlements only.
 func Solve(ctx context.Context, auction *api.Auction, cfg Config) Result {
-	res := Result{}
-	pools, skipped := BuildPools(auction.Liquidity)
-	res.Stats.PoolsUsable = len(pools)
-	res.Stats.PoolsSkipped = skipped
+	result := Result{}
+	pools, skipped := BuildPoolsContext(ctx, auction.Liquidity, cfg.MaxPools)
+	result.Stats.PoolsUsable = len(pools)
+	result.Stats.PoolsSkipped = skipped
+	if ctx.Err() != nil {
+		return result
+	}
 	graph := NewGraph(pools)
 
 	orders, unsupported := eligible(auction.Orders, cfg.MaxOrders)
-	res.Stats.Orders = len(orders)
-	res.Stats.DroppedUnsupportedOrder = unsupported
+	result.Stats.Orders = len(orders)
+	result.Stats.DroppedUnsupportedOrder = unsupported
 
 	gasPrice, ok := new(big.Int).SetString(auction.EffectiveGasPrice, 10)
 	if !ok || gasPrice.Sign() < 0 {
@@ -79,59 +86,63 @@ func Solve(ctx context.Context, auction *api.Auction, cfg Config) Result {
 
 	// --- Pass 1: pure CoW matches. No external liquidity, minimal gas. ---
 	matched := map[string]bool{}
-	for _, match := range findCoWMatches(orders) {
-		if err := ctx.Err(); err != nil {
+	for _, match := range findCoWMatchesContext(ctx, orders) {
+		if ctx.Err() != nil {
 			break
 		}
 		gas := cfg.SettlementOverheadGas + 2*cfg.PerTradeGas
 		if cfg.RequireProfitable && !cowProfitable(match, gas, gasPrice, auction.Tokens) {
 			// Stats count orders, not candidate solutions.
-			res.Stats.DroppedNotProfitable += 2
+			result.Stats.DroppedNotProfitable += 2
 			continue
 		}
 		solutions = append(solutions, match.solution(id, cfg))
 		id++
 		matched[match.A.UID] = true
 		matched[match.B.UID] = true
-		res.Stats.CoWMatches++
+		result.Stats.CoWMatches++
 	}
 
-	// --- Pass 2: baseline routing, one solution per remaining order. ---
+	// --- Pass 2: baseline routing, one candidate per remaining order. ---
+routeLoop:
 	for i := range orders {
-		if err := ctx.Err(); err != nil {
+		if ctx.Err() != nil {
 			break
 		}
 		order := &orders[i]
 		if matched[order.UID] {
 			continue
 		}
-		solution, surplus, surplusToken, gas, why := routeOrder(order, graph, cfg)
+		solution, surplus, surplusToken, gas, why := routeOrder(ctx, order, graph, cfg)
 		switch why {
+		case reasonCancelled:
+			break routeLoop
 		case reasonNoRoute:
-			res.Stats.DroppedNoRoute++
+			result.Stats.DroppedNoRoute++
 			continue
 		case reasonLimit:
-			res.Stats.DroppedLimit++
+			result.Stats.DroppedLimit++
 			continue
 		}
 		if cfg.RequireProfitable && !profitable(surplus, surplusToken, gas, gasPrice, auction.Tokens) {
-			res.Stats.DroppedNotProfitable++
+			result.Stats.DroppedNotProfitable++
 			continue
 		}
 		solution.ID = id
 		id++
 		solutions = append(solutions, solution)
-		res.Stats.BaselineRoutes++
+		result.Stats.BaselineRoutes++
 	}
 
+	result.Stats.CandidateSolutions = len(solutions)
 	if cfg.MaxSolutions <= 0 {
 		solutions = nil
 	} else if len(solutions) > cfg.MaxSolutions {
 		solutions = solutions[:cfg.MaxSolutions]
 	}
-	res.Solutions = solutions
-	res.Stats.Solutions = len(solutions)
-	return res
+	result.Solutions = solutions
+	result.Stats.Solutions = len(solutions)
+	return result
 }
 
 // eligible filters out orders this model cannot honestly settle. The driver
@@ -176,10 +187,11 @@ const (
 	reasonOK dropReason = iota
 	reasonNoRoute
 	reasonLimit
+	reasonCancelled
 )
 
 // routeOrder builds a single-order solution through AMM liquidity.
-func routeOrder(order *api.Order, graph *Graph, cfg Config) (api.Solution, *big.Int, string, uint64, dropReason) {
+func routeOrder(ctx context.Context, order *api.Order, graph *Graph, cfg Config) (api.Solution, *big.Int, string, uint64, dropReason) {
 	sellAmount, ok1 := new(big.Int).SetString(order.SellAmount, 10)
 	buyAmount, ok2 := new(big.Int).SetString(order.BuyAmount, 10)
 	if !ok1 || !ok2 || sellAmount.Sign() <= 0 || buyAmount.Sign() <= 0 {
@@ -188,7 +200,10 @@ func routeOrder(order *api.Order, graph *Graph, cfg Config) (api.Solution, *big.
 	sell, buy := strings.ToLower(order.SellToken), strings.ToLower(order.BuyToken)
 
 	if order.Kind == "buy" {
-		input, route := minInputFor(graph, sell, buy, buyAmount, sellAmount)
+		input, route, err := minInputFor(ctx, graph, sell, buy, buyAmount, sellAmount)
+		if err != nil {
+			return api.Solution{}, nil, "", 0, reasonCancelled
+		}
 		if route == nil {
 			return api.Solution{}, nil, "", 0, reasonNoRoute
 		}
@@ -203,7 +218,10 @@ func routeOrder(order *api.Order, graph *Graph, cfg Config) (api.Solution, *big.
 		return solution, surplus, sell, gas, reasonOK
 	}
 
-	route := graph.BestRoute(sell, buy, sellAmount)
+	route, err := graph.BestRouteContext(ctx, sell, buy, sellAmount)
+	if err != nil {
+		return api.Solution{}, nil, "", 0, reasonCancelled
+	}
 	if route == nil {
 		return api.Solution{}, nil, "", 0, reasonNoRoute
 	}
@@ -223,17 +241,26 @@ func routeOrder(order *api.Order, graph *Graph, cfg Config) (api.Solution, *big.
 
 // minInputFor binary-searches the smallest input that still buys want.
 // Route output is monotonic in input for every pool kind supported here.
-func minInputFor(graph *Graph, sell, buy string, want, maxIn *big.Int) (*big.Int, *Route) {
-	full := graph.BestRoute(sell, buy, maxIn)
+func minInputFor(ctx context.Context, graph *Graph, sell, buy string, want, maxIn *big.Int) (*big.Int, *Route, error) {
+	full, err := graph.BestRouteContext(ctx, sell, buy, maxIn)
+	if err != nil {
+		return nil, nil, err
+	}
 	if full == nil || full.Out.Cmp(want) < 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	lo, hi := big.NewInt(1), new(big.Int).Set(maxIn)
 	bestIn, bestRoute := new(big.Int).Set(maxIn), full
 	for i := 0; i < 256 && lo.Cmp(hi) <= 0; i++ {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
 		mid := new(big.Int).Add(lo, hi)
 		mid.Rsh(mid, 1)
-		route := graph.BestRoute(sell, buy, mid)
+		route, err := graph.BestRouteContext(ctx, sell, buy, mid)
+		if err != nil {
+			return nil, nil, err
+		}
 		if route != nil && route.Out.Cmp(want) >= 0 {
 			bestIn, bestRoute = new(big.Int).Set(mid), route
 			hi = new(big.Int).Sub(mid, big.NewInt(1))
@@ -241,7 +268,7 @@ func minInputFor(graph *Graph, sell, buy string, want, maxIn *big.Int) (*big.Int
 			lo = new(big.Int).Add(mid, big.NewInt(1))
 		}
 	}
-	return bestIn, bestRoute
+	return bestIn, bestRoute, nil
 }
 
 func hopsToInteractions(route *Route) []api.Interaction {
@@ -321,11 +348,19 @@ type Match struct {
 	SellA, SellB *big.Int
 }
 
-// findCoWMatches pairs opposite sell orders that can be swapped outright.
+// findCoWMatches is the context-free helper retained for focused tests.
 func findCoWMatches(orders []api.Order) []Match {
+	return findCoWMatchesContext(context.Background(), orders)
+}
+
+// findCoWMatchesContext pairs opposite sell orders whose limits cross.
+func findCoWMatchesContext(ctx context.Context, orders []api.Order) []Match {
 	type key struct{ sell, buy string }
 	bucket := map[key][]*api.Order{}
 	for i := range orders {
+		if ctx.Err() != nil {
+			return nil
+		}
 		order := &orders[i]
 		if order.Kind != "sell" {
 			continue
@@ -348,11 +383,17 @@ func findCoWMatches(orders []api.Order) []Match {
 	})
 
 	for _, pair := range keys {
+		if ctx.Err() != nil {
+			return out
+		}
 		reverse := key{pair.buy, pair.sell}
 		if pair.sell > pair.buy {
 			continue
 		}
 		for _, a := range bucket[pair] {
+			if ctx.Err() != nil {
+				return out
+			}
 			if used[a.UID] {
 				continue
 			}
@@ -362,6 +403,9 @@ func findCoWMatches(orders []api.Order) []Match {
 				continue
 			}
 			for _, b := range bucket[reverse] {
+				if ctx.Err() != nil {
+					return out
+				}
 				if used[b.UID] {
 					continue
 				}

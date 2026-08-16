@@ -1,6 +1,7 @@
 package solve
 
 import (
+	"context"
 	"encoding/json"
 	"math/big"
 	"sort"
@@ -11,182 +12,275 @@ import (
 	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/api"
 )
 
-// BuildPools converts the auction's liquidity array into routable pools.
-// Unsupported or malformed liquidity is skipped and counted, never guessed at.
-func BuildPools(liq []api.Liquidity) ([]*amm.Pool, map[string]int) {
-	pools := make([]*amm.Pool, 0, len(liq))
+const (
+	maxStablePoolTokens = 64
+	maxConcentratedTicks = 16_384
+	maxWireDecimalLength = 128
+)
+
+func BuildPools(liquidity []api.Liquidity) ([]*amm.Pool, map[string]int) {
+	return BuildPoolsContext(context.Background(), liquidity, 0)
+}
+
+func BuildPoolsContext(ctx context.Context, liquidity []api.Liquidity, maxPools int) ([]*amm.Pool, map[string]int) {
+	limit := len(liquidity)
 	skipped := map[string]int{}
-	for i := range liq {
-		p, err := buildPool(&liq[i])
-		if err != nil || p == nil {
-			kind := liq[i].Kind
+	if maxPools > 0 && limit > maxPools {
+		limit = maxPools
+		skipped["resourceLimit"] += len(liquidity) - limit
+	}
+
+	pools := make([]*amm.Pool, 0, limit)
+	for i := 0; i < limit; i++ {
+		if ctx.Err() != nil {
+			skipped["cancelled"] += limit - i
+			break
+		}
+		pool, err := buildPool(&liquidity[i])
+		if err != nil || pool == nil {
+			kind := liquidity[i].Kind
 			if kind == "" {
 				kind = "unknown"
 			}
 			skipped[kind]++
 			continue
 		}
-		pools = append(pools, p)
+		pools = append(pools, pool)
 	}
 	return pools, skipped
 }
 
-func buildPool(l *api.Liquidity) (*amm.Pool, error) {
-	feeNum, feeDen, err := amm.ParseDecimalRational(l.Fee)
-	if err != nil || feeDen.Sign() <= 0 || feeNum.Sign() < 0 || feeNum.Cmp(feeDen) >= 0 {
+func buildPool(liquidity *api.Liquidity) (*amm.Pool, error) {
+	trimmedFee := strings.TrimSpace(liquidity.Fee)
+	if trimmedFee == "" || trimmedFee == "-" || trimmedFee == "." || trimmedFee == "-." ||
+		len(trimmedFee) > maxWireDecimalLength {
 		return nil, errSkip
 	}
-	gas, _ := strconv.ParseUint(l.GasEstimate, 10, 64)
+	feeNum, feeDen, err := amm.ParseDecimalRational(trimmedFee)
+	if err != nil || feeDen.Sign() <= 0 || feeNum.Sign() < 0 || feeNum.Cmp(feeDen) >= 0 ||
+		feeNum.BitLen() > 256 || feeDen.BitLen() > 256 {
+		return nil, errSkip
+	}
+	if !decimalDigits(liquidity.GasEstimate, 20) {
+		return nil, errSkip
+	}
+	gas, err := strconv.ParseUint(liquidity.GasEstimate, 10, 64)
+	if err != nil {
+		return nil, errSkip
+	}
 	if gas == 0 {
 		gas = 90_000
 	}
 	base := &amm.Pool{
-		ID:          l.ID,
-		Kind:        l.Kind,
-		Address:     strings.ToLower(l.Address),
+		ID:          liquidity.ID,
+		Kind:        liquidity.Kind,
+		Address:     strings.ToLower(liquidity.Address),
 		GasEstimate: gas,
 		FeeNum:      feeNum,
 		FeeDen:      feeDen,
 	}
 
-	switch l.Kind {
+	switch liquidity.Kind {
 	case "constantProduct":
-		var toks map[string]api.TokenReserve
-		if err := json.Unmarshal(l.Tokens, &toks); err != nil {
+		var tokens map[string]api.TokenReserve
+		if err := json.Unmarshal(liquidity.Tokens, &tokens); err != nil {
 			return nil, err
 		}
-		if len(toks) != 2 {
+		if len(tokens) != 2 {
 			return nil, errSkip
 		}
-		addrs := make([]string, 0, 2)
+		addresses := make([]string, 0, 2)
 		seen := map[string]bool{}
-		for a := range toks {
-			normalized := strings.ToLower(a)
+		for address := range tokens {
+			normalized := strings.ToLower(address)
 			if seen[normalized] {
 				return nil, errSkip
 			}
 			seen[normalized] = true
-			addrs = append(addrs, normalized)
+			addresses = append(addresses, normalized)
 		}
-		sort.Strings(addrs)
-		ra, oka := new(big.Int).SetString(reserveOf(toks, addrs[0]), 10)
-		rb, okb := new(big.Int).SetString(reserveOf(toks, addrs[1]), 10)
-		if !oka || !okb || ra.Sign() <= 0 || rb.Sign() <= 0 {
+		sort.Strings(addresses)
+		reserveA, okA := parsePositiveUnsigned(reserveOf(tokens, addresses[0]), 256)
+		reserveB, okB := parsePositiveUnsigned(reserveOf(tokens, addresses[1]), 256)
+		if !okA || !okB {
 			return nil, errSkip
 		}
-		base.TokenA, base.TokenB = addrs[0], addrs[1]
-		base.ReserveA, base.ReserveB = ra, rb
+		base.TokenA, base.TokenB = addresses[0], addresses[1]
+		base.ReserveA, base.ReserveB = reserveA, reserveB
 		return base, nil
 
 	case "concentratedLiquidity":
-		var toks []string
-		if err := json.Unmarshal(l.Tokens, &toks); err != nil || len(toks) != 2 {
+		var tokens []string
+		if err := json.Unmarshal(liquidity.Tokens, &tokens); err != nil || len(tokens) != 2 {
 			return nil, errSkip
 		}
-		toks[0], toks[1] = strings.ToLower(toks[0]), strings.ToLower(toks[1])
-		if toks[0] == toks[1] {
+		tokens[0], tokens[1] = strings.ToLower(tokens[0]), strings.ToLower(tokens[1])
+		if tokens[0] == tokens[1] || len(liquidity.LiquidityNet) > maxConcentratedTicks {
 			return nil, errSkip
 		}
-		sp, ok1 := new(big.Int).SetString(l.SqrtPrice, 10)
-		lq, ok2 := new(big.Int).SetString(l.Liquidity, 10)
-		if !ok1 || !ok2 || l.Tick == nil || sp.Sign() <= 0 || lq.Sign() <= 0 {
+		sqrtPrice, okPrice := parsePositiveUnsigned(liquidity.SqrtPrice, 256)
+		liquidityAmount, okLiquidity := parsePositiveUnsigned(liquidity.Liquidity, 128)
+		if !okPrice || !okLiquidity || liquidity.Tick == nil ||
+			*liquidity.Tick < amm.MinTick || *liquidity.Tick > amm.MaxTick {
 			return nil, errSkip
 		}
-		ticks := make([]amm.Tick, 0, len(l.LiquidityNet))
-		for k, v := range l.LiquidityNet {
-			idx, err := strconv.ParseInt(k, 10, 32)
-			if err != nil {
-				continue
+		ticks := make([]amm.Tick, 0, len(liquidity.LiquidityNet))
+		seenTicks := make(map[int32]struct{}, len(liquidity.LiquidityNet))
+		for rawIndex, rawNet := range liquidity.LiquidityNet {
+			index, err := strconv.ParseInt(rawIndex, 10, 32)
+			if err != nil || index < int64(amm.MinTick) || index > int64(amm.MaxTick) {
+				return nil, errSkip
 			}
-			net, ok := new(big.Int).SetString(v, 10)
+			parsedIndex := int32(index)
+			if _, duplicate := seenTicks[parsedIndex]; duplicate {
+				return nil, errSkip
+			}
+			seenTicks[parsedIndex] = struct{}{}
+			net, ok := parseSignedInteger(rawNet, 128)
 			if !ok {
-				continue
+				return nil, errSkip
 			}
-			ticks = append(ticks, amm.Tick{Index: int32(idx), Net: net})
+			ticks = append(ticks, amm.Tick{Index: parsedIndex, Net: net})
 		}
 		amm.SortTicks(ticks)
-		base.TokenA, base.TokenB = toks[0], toks[1]
-		base.SqrtPriceX96, base.Liquidity, base.Tick, base.Ticks = sp, lq, *l.Tick, ticks
+		base.TokenA, base.TokenB = tokens[0], tokens[1]
+		base.SqrtPriceX96 = sqrtPrice
+		base.Liquidity = liquidityAmount
+		base.Tick = *liquidity.Tick
+		base.Ticks = ticks
 		return base, nil
 
 	case "stable":
-		var toks map[string]struct {
+		var tokens map[string]struct {
 			Balance       string `json:"balance"`
 			ScalingFactor string `json:"scalingFactor"`
 		}
-		if err := json.Unmarshal(l.Tokens, &toks); err != nil || len(toks) < 2 {
+		if err := json.Unmarshal(liquidity.Tokens, &tokens); err != nil ||
+			len(tokens) < 2 || len(tokens) > maxStablePoolTokens {
 			return nil, errSkip
 		}
-		// The amplification parameter is a plain decimal on the wire; the
-		// StableMath implementation expects it multiplied by AMP_PRECISION.
-		ampNum, ampDen, err := amm.ParseDecimalRational(l.AmplificationParameter)
+		ampText := strings.TrimSpace(liquidity.AmplificationParameter)
+		if ampText == "" || ampText == "-" || ampText == "." || ampText == "-." ||
+			len(ampText) > maxWireDecimalLength {
+			return nil, errSkip
+		}
+		ampNum, ampDen, err := amm.ParseDecimalRational(ampText)
 		if err != nil || ampNum.Sign() <= 0 || ampDen.Sign() <= 0 {
 			return nil, errSkip
 		}
 		ampRaw := new(big.Int).Mul(ampNum, big.NewInt(1000))
 		ampRaw.Quo(ampRaw, ampDen)
-		if ampRaw.Sign() <= 0 {
+		if ampRaw.Sign() <= 0 || ampRaw.BitLen() > 256 {
 			return nil, errSkip
 		}
 
-		addrs := make([]string, 0, len(toks))
+		addresses := make([]string, 0, len(tokens))
 		seen := map[string]bool{}
-		for a := range toks {
-			normalized := strings.ToLower(a)
+		for address := range tokens {
+			normalized := strings.ToLower(address)
 			if seen[normalized] {
 				return nil, errSkip
 			}
 			seen[normalized] = true
-			addrs = append(addrs, normalized)
+			addresses = append(addresses, normalized)
 		}
-		sort.Strings(addrs)
+		sort.Strings(addresses)
 
-		balances := make([]*big.Int, 0, len(addrs))
-		scales := make([]*big.Int, 0, len(addrs))
-		for _, a := range addrs {
+		balances := make([]*big.Int, 0, len(addresses))
+		scalingFactors := make([]*big.Int, 0, len(addresses))
+		for _, address := range addresses {
 			var raw struct{ Balance, ScalingFactor string }
-			for k, v := range toks {
-				if strings.EqualFold(k, a) {
-					raw.Balance, raw.ScalingFactor = v.Balance, v.ScalingFactor
+			for key, value := range tokens {
+				if strings.EqualFold(key, address) {
+					raw.Balance = value.Balance
+					raw.ScalingFactor = value.ScalingFactor
 					break
 				}
 			}
-			bal, ok := new(big.Int).SetString(raw.Balance, 10)
-			if !ok || bal.Sign() <= 0 {
+			balance, ok := parsePositiveUnsigned(raw.Balance, 256)
+			scaleText := strings.TrimSpace(raw.ScalingFactor)
+			if !ok || scaleText == "" || scaleText == "-" || scaleText == "." || scaleText == "-." ||
+				len(scaleText) > maxWireDecimalLength {
 				return nil, errSkip
 			}
-			// scalingFactor is sent as a decimal representation of an 18-decimal
-			// fixed-point value. Convert it back to the raw fixed-point integer.
-			sfNum, sfDen, err := amm.ParseDecimalRational(raw.ScalingFactor)
-			if err != nil || sfNum.Sign() <= 0 || sfDen.Sign() <= 0 {
+			scaleNum, scaleDen, err := amm.ParseDecimalRational(scaleText)
+			if err != nil || scaleNum.Sign() <= 0 || scaleDen.Sign() <= 0 {
 				return nil, errSkip
 			}
-			sf := new(big.Int).Mul(sfNum, new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil))
-			sf.Quo(sf, sfDen)
-			if sf.Sign() <= 0 {
+			scale := new(big.Int).Mul(scaleNum, new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil))
+			scale.Quo(scale, scaleDen)
+			if scale.Sign() <= 0 || scale.BitLen() > 256 {
 				return nil, errSkip
 			}
-			balances = append(balances, bal)
-			scales = append(scales, sf)
+			balances = append(balances, balance)
+			scalingFactors = append(scalingFactors, scale)
 		}
 
-		base.TokenList = addrs
+		base.TokenList = addresses
 		base.Balances = balances
-		base.ScalingFactors = scales
+		base.ScalingFactors = scalingFactors
 		base.AmplificationRaw = ampRaw
-		base.TokenA, base.TokenB = addrs[0], addrs[1]
+		base.TokenA, base.TokenB = addresses[0], addresses[1]
 		return base, nil
 	}
 	return nil, errSkip
 }
 
-func reserveOf(m map[string]api.TokenReserve, addr string) string {
-	for k, v := range m {
-		if strings.EqualFold(k, addr) {
-			return v.Balance
+func reserveOf(tokens map[string]api.TokenReserve, address string) string {
+	for key, value := range tokens {
+		if strings.EqualFold(key, address) {
+			return value.Balance
 		}
 	}
 	return "0"
+}
+
+func decimalDigits(raw string, maxDigits int) bool {
+	if raw == "" || len(raw) > maxDigits {
+		return false
+	}
+	for i := 0; i < len(raw); i++ {
+		if raw[i] < '0' || raw[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func parsePositiveUnsigned(raw string, bits int) (*big.Int, bool) {
+	maxDigits := (bits*30103)/100000 + 1
+	if !decimalDigits(raw, maxDigits) {
+		return nil, false
+	}
+	value, ok := new(big.Int).SetString(raw, 10)
+	if !ok || value.Sign() <= 0 || value.BitLen() > bits {
+		return nil, false
+	}
+	return value, true
+}
+
+func parseSignedInteger(raw string, bits int) (*big.Int, bool) {
+	if raw == "" || len(raw) > 1+(bits*30103)/100000+1 {
+		return nil, false
+	}
+	digits := raw
+	if raw[0] == '-' {
+		digits = raw[1:]
+	}
+	if !decimalDigits(digits, len(digits)) {
+		return nil, false
+	}
+	value, ok := new(big.Int).SetString(raw, 10)
+	if !ok {
+		return nil, false
+	}
+	limit := new(big.Int).Lsh(big.NewInt(1), uint(bits-1))
+	min := new(big.Int).Neg(new(big.Int).Set(limit))
+	max := new(big.Int).Sub(new(big.Int).Set(limit), big.NewInt(1))
+	if value.Cmp(min) < 0 || value.Cmp(max) > 0 {
+		return nil, false
+	}
+	return value, true
 }
 
 type skipErr struct{}
