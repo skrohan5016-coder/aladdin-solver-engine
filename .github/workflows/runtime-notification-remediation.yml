@@ -36,6 +36,16 @@ jobs:
         run: |
           set -euo pipefail
           cat scripts/.runtime-notification-remediation.* > scripts/runtime_notification_remediation.py
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("scripts/runtime_notification_remediation.py")
+          text = path.read_text()
+          old = 'marker = "// ---------- Notification (driver -> solver) ----------\\n"'
+          new = 'marker = "type Notification struct {\\n"'
+          if text.count(old) != 1:
+              raise SystemExit(f"unexpected marker count: {text.count(old)}")
+          path.write_text(text.replace(old, new, 1))
+          PY
           python3 scripts/runtime_notification_remediation.py
           rm scripts/.runtime-notification-remediation.*
           rm scripts/runtime_notification_remediation.py
