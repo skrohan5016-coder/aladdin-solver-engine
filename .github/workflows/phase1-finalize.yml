@@ -1,0 +1,125 @@
+name: phase1-wire-contract-finalize
+
+on:
+  push:
+    branches:
+      - agent/phase1-wire-contract-v1
+
+permissions:
+  actions: read
+  contents: write
+  pull-requests: write
+
+env:
+  GOTOOLCHAIN: local
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  finalize:
+    if: startsWith(github.event.head_commit.message, '[phase1-finalizer]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out Phase 1 branch
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: agent/phase1-wire-contract-v1
+          fetch-depth: 0
+
+      - name: Set up pinned Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Verify accepted inventory and governed gates
+        run: |
+          test -f docs/PHASE1_ACCEPTANCE_REVIEW.md
+          test -f docs/PHASE1_WIRE_CONTRACT.md
+          test -f contract/cow-v1/manifest.json
+          test ! -f scripts/phase1_builder.py
+          test ! -f scripts/phase1_acceptance.py
+          test ! -f .github/workflows/phase1-wire-contract-builder.yml
+          test ! -f .github/workflows/phase1-acceptance.yml
+          go run ./cmd/contractcheck -root .
+          python3 scripts/generate_reference_vectors.py --check
+          bash scripts/ci.sh
+
+      - name: Create final workflow-free candidate
+        id: seal
+        run: |
+          rm .github/workflows/phase1-finalize.yml
+          git diff --check
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git diff --cached --check
+          git commit -m "chore: seal Phase 1 acceptance candidate"
+          git push origin HEAD:agent/phase1-wire-contract-v1
+          final_head="$(git rev-parse HEAD)"
+          echo "final_head=$final_head" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for exact-head and merge-ref CI
+        id: ci
+        env:
+          FINAL_HEAD: ${{ steps.seal.outputs.final_head }}
+        run: |
+          repository="$GITHUB_REPOSITORY"
+          push_run=""
+          pr_run=""
+          for attempt in $(seq 1 90); do
+            runs="$(gh api "repos/${repository}/actions/runs?head_sha=${FINAL_HEAD}&per_page=100")"
+            push_run="$(printf '%s' "$runs" | jq -r '[.workflow_runs[] | select(.name == "ci" and .event == "push")][0].id // empty')"
+            push_state="$(printf '%s' "$runs" | jq -r '[.workflow_runs[] | select(.name == "ci" and .event == "push")][0].status // empty')"
+            push_result="$(printf '%s' "$runs" | jq -r '[.workflow_runs[] | select(.name == "ci" and .event == "push")][0].conclusion // empty')"
+            pr_run="$(printf '%s' "$runs" | jq -r '[.workflow_runs[] | select(.name == "ci" and .event == "pull_request")][0].id // empty')"
+            pr_state="$(printf '%s' "$runs" | jq -r '[.workflow_runs[] | select(.name == "ci" and .event == "pull_request")][0].status // empty')"
+            pr_result="$(printf '%s' "$runs" | jq -r '[.workflow_runs[] | select(.name == "ci" and .event == "pull_request")][0].conclusion // empty')"
+
+            if [ "$push_state" = "completed" ] && [ "$push_result" != "success" ]; then
+              echo "exact-head CI failed: run $push_run conclusion $push_result" >&2
+              exit 1
+            fi
+            if [ "$pr_state" = "completed" ] && [ "$pr_result" != "success" ]; then
+              echo "merge-ref CI failed: run $pr_run conclusion $pr_result" >&2
+              exit 1
+            fi
+            if [ "$push_state" = "completed" ] && [ "$push_result" = "success" ] && \
+               [ "$pr_state" = "completed" ] && [ "$pr_result" = "success" ]; then
+              echo "push_run=$push_run" >> "$GITHUB_OUTPUT"
+              echo "pr_run=$pr_run" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "timed out before both final CI paths completed" >&2
+          exit 1
+
+      - name: Publish exact acceptance evidence and mark ready
+        env:
+          FINAL_HEAD: ${{ steps.seal.outputs.final_head }}
+          PUSH_RUN: ${{ steps.ci.outputs.push_run }}
+          PR_RUN: ${{ steps.ci.outputs.pr_run }}
+        run: |
+          pr_number="$(gh pr list --repo "$GITHUB_REPOSITORY" --head agent/phase1-wire-contract-v1 --state open --json number --jq '.[0].number')"
+          test -n "$pr_number"
+          current_body="$(gh pr view "$pr_number" --repo "$GITHUB_REPOSITORY" --json body --jq .body)"
+          printf '%s\n' "$current_body" > /tmp/pr-body.md
+          cat >> /tmp/pr-body.md <<EOF
+
+## Exact final acceptance
+
+Final head: \`${FINAL_HEAD}\`
+
+- exact branch-head CI run \`${PUSH_RUN}\`: success;
+- current GitHub merge-ref CI run \`${PR_RUN}\`: success;
+- temporary builder, acceptance, and finalizer automation is absent from the final tree;
+- detailed evidence: \`docs/PHASE1_ACCEPTANCE_REVIEW.md\`.
+
+Do not merge or enable auto-merge without Rohan's explicit command:
+
+\`CONFIRM MERGE PR #${pr_number} HEAD ${FINAL_HEAD} SQUASH\`
+EOF
+          gh pr edit "$pr_number" --repo "$GITHUB_REPOSITORY" --body-file /tmp/pr-body.md
+          gh pr ready "$pr_number" --repo "$GITHUB_REPOSITORY"
+          gh pr comment "$pr_number" --repo "$GITHUB_REPOSITORY" --body "Phase 1 final candidate is verified. Exact head: \`${FINAL_HEAD}\`. Exact-head CI: \`${PUSH_RUN}\` success. Merge-ref CI: \`${PR_RUN}\` success. Approval command: \`CONFIRM MERGE PR #${pr_number} HEAD ${FINAL_HEAD} SQUASH\`."
