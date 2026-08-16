@@ -1,0 +1,12 @@
+# Recorded shadow data — never commit this
+/data/
+*.jsonl
+
+# Local tuning. This is where the actual edge lives; keep it off GitHub.
+config.local.*
+.env
+
+# Build output
+/bin/
+solver
+report
