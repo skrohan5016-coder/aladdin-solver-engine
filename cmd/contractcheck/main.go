@@ -29,7 +29,7 @@ type manifest struct {
 		Repository string `json:"repository"`
 		Commit     string `json:"commit"`
 	} `json:"upstream"`
-	Fixtures []manifestFixture `json:"fixtures"`
+	Fixtures    []manifestFixture `json:"fixtures"`
 	ReplayPairs []struct {
 		Auction  string `json:"auction"`
 		Solution string `json:"solution"`
@@ -187,8 +187,8 @@ func run(dir string) error {
 }
 
 func fixturePath(dir, name string) (string, error) {
-	if name == "" || filepath.IsAbs(name) || filepath.Clean(name) != name || filepath.Base(name) != name ||
-		strings.ContainsAny(name, `/\\`) {
+	if name == "" || name == "." || name == ".." || filepath.IsAbs(name) || filepath.Clean(name) != name || filepath.Base(name) != name ||
+		strings.ContainsAny(name, `/\`) {
 		return "", fmt.Errorf("unsafe fixture path %q", name)
 	}
 	return filepath.Join(dir, name), nil
