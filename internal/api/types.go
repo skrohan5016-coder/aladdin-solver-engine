@@ -140,9 +140,11 @@ type Interaction struct {
 
 // Notification keeps all unknown metadata because notification payloads are
 // explicitly extensible and are the evidence needed to explain shadow results.
+// SolutionID is json.Number so IDs above JavaScript's exact-integer range are
+// retained byte-for-byte instead of being rounded through float64.
 type Notification struct {
 	AuctionID  string                     `json:"auctionId"`
-	SolutionID float64                    `json:"solutionId"`
+	SolutionID json.Number                `json:"solutionId"`
 	Kind       string                     `json:"kind"`
 	Extra      map[string]json.RawMessage `json:"-"`
 }
@@ -191,7 +193,11 @@ func (n Notification) MarshalJSON() ([]byte, error) {
 	if err := put("auctionId", n.AuctionID); err != nil {
 		return nil, err
 	}
-	if err := put("solutionId", n.SolutionID); err != nil {
+	solutionID := n.SolutionID
+	if solutionID == "" {
+		solutionID = json.Number("0")
+	}
+	if err := put("solutionId", solutionID); err != nil {
 		return nil, err
 	}
 	if err := put("kind", n.Kind); err != nil {
