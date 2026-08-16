@@ -2,6 +2,7 @@ package solve
 
 import (
 	"math/big"
+	"sort"
 	"strings"
 
 	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/amm"
@@ -27,7 +28,7 @@ type Route struct {
 type Graph struct {
 	byToken map[string][]*amm.Pool
 	// intermediates are the tokens allowed as a 2-hop pivot, ordered by how
-	// many pools reference them (deepest liquidity first).
+	// many pools reference them (deepest connectivity first).
 	intermediates []string
 }
 
@@ -35,26 +36,26 @@ func NewGraph(pools []*amm.Pool) *Graph {
 	g := &Graph{byToken: map[string][]*amm.Pool{}}
 	count := map[string]int{}
 	for _, p := range pools {
-		for _, t := range p.AllTokens() {
-			t = strings.ToLower(t)
-			g.byToken[t] = append(g.byToken[t], p)
-			count[t]++
+		for _, token := range p.AllTokens() {
+			token = strings.ToLower(token)
+			g.byToken[token] = append(g.byToken[token], p)
+			count[token]++
 		}
 	}
-	for tok, n := range count {
+	for token, n := range count {
 		if n >= 2 {
-			g.intermediates = append(g.intermediates, tok)
+			g.intermediates = append(g.intermediates, token)
 		}
 	}
-	// Most-connected tokens first; these are the real base assets of the
-	// auction (WETH, USDC, ...) without hardcoding any address.
-	for i := 0; i < len(g.intermediates); i++ {
-		for j := i + 1; j < len(g.intermediates); j++ {
-			if count[g.intermediates[j]] > count[g.intermediates[i]] {
-				g.intermediates[i], g.intermediates[j] = g.intermediates[j], g.intermediates[i]
-			}
+	// Map iteration is deliberately removed from the final ordering. Equal
+	// connectivity is broken lexicographically so replay is deterministic.
+	sort.Slice(g.intermediates, func(i, j int) bool {
+		left, right := g.intermediates[i], g.intermediates[j]
+		if count[left] != count[right] {
+			return count[left] > count[right]
 		}
-	}
+		return left < right
+	})
 	if len(g.intermediates) > maxIntermediates {
 		g.intermediates = g.intermediates[:maxIntermediates]
 	}
@@ -106,8 +107,9 @@ func (g *Graph) BestRoute(sellToken, buyToken string, amountIn *big.Int) *Route 
 			if err != nil {
 				continue
 			}
-			if leg1 == nil || out.Cmp(leg1.Out) > 0 {
-				leg1 = &Hop{Pool: p, TokenIn: sellToken, TokenOut: mid, AmountIn: amountIn, Out: out}
+			candidate := &Hop{Pool: p, TokenIn: sellToken, TokenOut: mid, AmountIn: amountIn, Out: out}
+			if betterHop(leg1, candidate) == candidate {
+				leg1 = candidate
 			}
 		}
 		if leg1 == nil {
@@ -115,15 +117,18 @@ func (g *Graph) BestRoute(sellToken, buyToken string, amountIn *big.Int) *Route 
 		}
 		var leg2 *Hop
 		for _, p := range g.poolsFor(mid) {
-			if !p.Supports(mid, buyToken) {
+			// Quoting the same stateful pool twice without applying the first
+			// swap's state transition is not a valid route simulation.
+			if p == leg1.Pool || !p.Supports(mid, buyToken) {
 				continue
 			}
 			out, err := p.QuoteExactInPair(mid, buyToken, leg1.Out)
 			if err != nil {
 				continue
 			}
-			if leg2 == nil || out.Cmp(leg2.Out) > 0 {
-				leg2 = &Hop{Pool: p, TokenIn: mid, TokenOut: buyToken, AmountIn: leg1.Out, Out: out}
+			candidate := &Hop{Pool: p, TokenIn: mid, TokenOut: buyToken, AmountIn: leg1.Out, Out: out}
+			if betterHop(leg2, candidate) == candidate {
+				leg2 = candidate
 			}
 		}
 		if leg2 == nil {
@@ -139,12 +144,31 @@ func (g *Graph) BestRoute(sellToken, buyToken string, amountIn *big.Int) *Route 
 	return best
 }
 
-func (g *Graph) poolsFor(tok string) []*amm.Pool {
-	ps := g.byToken[tok]
-	if len(ps) > maxPoolsPerToken {
-		return ps[:maxPoolsPerToken]
+func (g *Graph) poolsFor(token string) []*amm.Pool {
+	pools := g.byToken[token]
+	if len(pools) > maxPoolsPerToken {
+		return pools[:maxPoolsPerToken]
 	}
-	return ps
+	return pools
+}
+
+func betterHop(a, b *Hop) *Hop {
+	if a == nil {
+		return b
+	}
+	if b == nil {
+		return a
+	}
+	if cmp := b.Out.Cmp(a.Out); cmp != 0 {
+		if cmp > 0 {
+			return b
+		}
+		return a
+	}
+	if hopKey(b) < hopKey(a) {
+		return b
+	}
+	return a
 }
 
 func better(a, b *Route) *Route {
@@ -154,8 +178,33 @@ func better(a, b *Route) *Route {
 	if b == nil {
 		return a
 	}
-	if b.Out.Cmp(a.Out) > 0 {
+	if cmp := b.Out.Cmp(a.Out); cmp != 0 {
+		if cmp > 0 {
+			return b
+		}
+		return a
+	}
+	if b.Gas != a.Gas {
+		if b.Gas < a.Gas {
+			return b
+		}
+		return a
+	}
+	if routeKey(b) < routeKey(a) {
 		return b
 	}
 	return a
+}
+
+func hopKey(h *Hop) string {
+	return h.Pool.Kind + "\x00" + h.Pool.ID + "\x00" + h.TokenIn + "\x00" + h.TokenOut
+}
+
+func routeKey(route *Route) string {
+	var b strings.Builder
+	for _, hop := range route.Hops {
+		b.WriteString(hopKey(&hop))
+		b.WriteByte('\x00')
+	}
+	return b.String()
 }
