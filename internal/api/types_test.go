@@ -17,7 +17,7 @@ func TestNotificationPreservesUnknownMetadata(t *testing.T) {
 	if err := json.Unmarshal(input, &notification); err != nil {
 		t.Fatal(err)
 	}
-	if notification.AuctionID != "42" || notification.SolutionID.String() != "7" || notification.Kind != "success" {
+	if notification.AuctionIDString() != "42" || notification.SolutionIDString() != "7" || notification.Kind != "success" {
 		t.Fatalf("core fields changed: %+v", notification)
 	}
 	if len(notification.Extra) != 2 {
@@ -39,15 +39,15 @@ func TestNotificationPreservesUnknownMetadata(t *testing.T) {
 	}
 }
 
-func TestNotificationPreservesSolutionIDAboveFloatRange(t *testing.T) {
+func TestNotificationPreservesMergedSolutionIDsAboveFloatRange(t *testing.T) {
 	const largeID = "9007199254740993"
-	input := []byte(`{"auctionId":"42","solutionId":` + largeID + `,"kind":"success"}`)
+	input := []byte(`{"auctionId":"42","solutionId":[7,` + largeID + `],"kind":"settlementStarted"}`)
 	var notification Notification
 	if err := json.Unmarshal(input, &notification); err != nil {
 		t.Fatal(err)
 	}
-	if notification.SolutionID.String() != largeID {
-		t.Fatalf("solution id changed: got %q want %q", notification.SolutionID, largeID)
+	if notification.SolutionIDString() != "[7,"+largeID+"]" {
+		t.Fatalf("solution ids changed: %q", notification.SolutionIDString())
 	}
 	encoded, err := json.Marshal(notification)
 	if err != nil {
@@ -57,18 +57,28 @@ func TestNotificationPreservesSolutionIDAboveFloatRange(t *testing.T) {
 	if err := json.Unmarshal(encoded, &fields); err != nil {
 		t.Fatal(err)
 	}
-	if string(fields["solutionId"]) != largeID {
-		t.Fatalf("encoded solution id changed: %s", encoded)
+	if string(fields["solutionId"]) != "[7,"+largeID+"]" {
+		t.Fatalf("encoded solution ids changed: %s", encoded)
 	}
 }
 
-func TestNotificationRejectsMissingOrNullCoreFields(t *testing.T) {
+func TestNotificationAllowsOptionalIDsAndRequiresKind(t *testing.T) {
 	for _, input := range []string{
-		`{"solutionId":1,"kind":"success"}`,
-		`{"auctionId":"42","kind":"success"}`,
+		`{"kind":"timeout"}`,
+		`{"auctionId":null,"solutionId":null,"kind":"timeout"}`,
+		`{"auctionId":"-1","solutionId":[],"kind":"cancelled"}`,
+	} {
+		var notification Notification
+		if err := json.Unmarshal([]byte(input), &notification); err != nil {
+			t.Errorf("runtime-compatible notification was rejected: %s: %v", input, err)
+		}
+	}
+	for _, input := range []string{
 		`{"auctionId":"42","solutionId":1}`,
-		`{"auctionId":null,"solutionId":1,"kind":"success"}`,
-		`{"auctionId":"42","solutionId":null,"kind":"success"}`,
+		`{"auctionId":42,"solutionId":1,"kind":"success"}`,
+		`{"auctionId":"42","solutionId":"1","kind":"success"}`,
+		`{"auctionId":"42","solutionId":[1,null],"kind":"success"}`,
+		`{"auctionId":"42","solutionId":-1,"kind":"success"}`,
 		`{"auctionId":"42","solutionId":1,"kind":null}`,
 	} {
 		var notification Notification
@@ -79,16 +89,17 @@ func TestNotificationRejectsMissingOrNullCoreFields(t *testing.T) {
 }
 
 func TestNotificationUnmarshalReplacesPreviousState(t *testing.T) {
+	oldAuction := "old"
 	notification := Notification{
-		AuctionID:  "old",
-		SolutionID: json.Number("9"),
+		AuctionID:  &oldAuction,
+		SolutionID: NewSingleNotificationSolutionID(9),
 		Kind:       "old",
 		Extra:      map[string]json.RawMessage{"stale": json.RawMessage(`true`)},
 	}
-	if err := json.Unmarshal([]byte(`{"auctionId":"new","solutionId":0,"kind":"success"}`), &notification); err != nil {
+	if err := json.Unmarshal([]byte(`{"kind":"success"}`), &notification); err != nil {
 		t.Fatal(err)
 	}
-	if notification.AuctionID != "new" || notification.SolutionID.String() != "0" || notification.Kind != "success" {
+	if notification.AuctionID != nil || notification.SolutionID != nil || notification.Kind != "success" {
 		t.Fatalf("old core state survived unmarshal: %+v", notification)
 	}
 	if _, ok := notification.Extra["stale"]; ok {

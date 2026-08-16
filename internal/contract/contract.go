@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 )
 
 const (
@@ -19,6 +20,7 @@ var UpstreamFiles = map[string]string{
 	"crates/driver/src/infra/solver/dto/auction.rs":                "f857f86838ce8a2a0b9ab0c7185e23eb4c8bcb9f",
 	"crates/liquidity-sources/src/balancer_v2/swap/stable_math.rs": "3d181998518804abe621f739c033f0e0d75d9dd1",
 	"crates/solvers-dto/src/auction.rs":                            "6c82fd4e461a32d73453feb68d79686642f802d6",
+	"crates/solvers-dto/src/notification.rs":                       "dbbff28c235d3ba7fc559d774ba06a305385fffb",
 	"crates/solvers-dto/src/solution.rs":                           "816486e47ba0ac8d19da8a31ee722c103ee6c416",
 	"crates/solvers/openapi.yml":                                   "64a2466292446ea5f637c809f754fb4a31211a16",
 }
@@ -449,20 +451,57 @@ func ValidateNotificationJSON(data []byte) error {
 	if err != nil {
 		return err
 	}
-	for _, name := range []string{"auctionId", "solutionId", "kind"} {
-		if _, ok := value[name]; !ok {
-			return fmt.Errorf("notification: missing required field %q", name)
+	kind, ok := value["kind"]
+	if !ok {
+		return errors.New("notification: missing required field \"kind\"")
+	}
+	if err := stringValue(kind, "notification.kind"); err != nil {
+		return err
+	}
+	if raw, ok := value["auctionId"]; ok && !isNull(raw) {
+		var id string
+		if err := json.Unmarshal(raw, &id); err != nil {
+			return errors.New("notification.auctionId: expected decimal string or null")
+		}
+		if _, err := strconv.ParseInt(id, 10, 64); err != nil {
+			return fmt.Errorf("notification.auctionId: invalid i64: %w", err)
 		}
 	}
-	if err := stringValue(value["auctionId"], "notification.auctionId"); err != nil {
-		return err
+	if raw, ok := value["solutionId"]; ok && !isNull(raw) {
+		if err := notificationSolutionIDValue(raw, "notification.solutionId"); err != nil {
+			return err
+		}
 	}
-	if err := numberValue(value["solutionId"], "notification.solutionId"); err != nil {
-		return err
-	}
-	return stringValue(value["kind"], "notification.kind")
+	return nil
 }
 
+func notificationSolutionIDValue(raw json.RawMessage, path string) error {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		items, err := array(raw, path)
+		if err != nil {
+			return err
+		}
+		for index, item := range items {
+			if err := uint64NumberValue(item, fmt.Sprintf("%s[%d]", path, index)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return uint64NumberValue(raw, path)
+}
+
+func uint64NumberValue(raw json.RawMessage, path string) error {
+	if isNull(raw) {
+		return fmt.Errorf("%s: expected uint64", path)
+	}
+	var value uint64
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return fmt.Errorf("%s: expected uint64: %w", path, err)
+	}
+	return nil
+}
 func object(raw []byte, path string) (map[string]json.RawMessage, error) {
 	var value map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &value); err != nil {
@@ -521,6 +560,9 @@ func requiredString(value map[string]json.RawMessage, name, path string) (string
 }
 
 func stringValue(raw json.RawMessage, path string) error {
+	if isNull(raw) {
+		return fmt.Errorf("%s: expected string", path)
+	}
 	var value string
 	if err := json.Unmarshal(raw, &value); err != nil {
 		return fmt.Errorf("%s: expected string", path)
@@ -529,6 +571,9 @@ func stringValue(raw json.RawMessage, path string) error {
 }
 
 func boolValue(raw json.RawMessage, path string) error {
+	if isNull(raw) {
+		return fmt.Errorf("%s: expected boolean", path)
+	}
 	var value bool
 	if err := json.Unmarshal(raw, &value); err != nil {
 		return fmt.Errorf("%s: expected boolean", path)
@@ -537,10 +582,13 @@ func boolValue(raw json.RawMessage, path string) error {
 }
 
 func numberValue(raw json.RawMessage, path string) error {
+	if isNull(raw) {
+		return fmt.Errorf("%s: expected number", path)
+	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
 	var value json.Number
-	if err := decoder.Decode(&value); err != nil {
+	if err := decoder.Decode(&value); err != nil || value.String() == "" {
 		return fmt.Errorf("%s: expected number", path)
 	}
 	return nil

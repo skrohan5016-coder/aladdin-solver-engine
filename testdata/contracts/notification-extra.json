@@ -1,6 +1,9 @@
 {
   "auctionId": "42001",
-  "solutionId": 9007199254740993,
+  "solutionId": [
+    7,
+    9007199254740993
+  ],
   "kind": "success",
   "rank": 2,
   "details": {

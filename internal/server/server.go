@@ -114,8 +114,8 @@ func (s *Server) handleNotify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.log.Info("notify",
-		"auction", notification.AuctionID,
-		"solution", notification.SolutionID,
+		"auction", notification.AuctionIDString(),
+		"solution", notification.SolutionIDString(),
 		"kind", notification.Kind,
 	)
 	if s.rec != nil {

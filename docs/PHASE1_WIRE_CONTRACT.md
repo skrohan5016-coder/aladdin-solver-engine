@@ -14,13 +14,16 @@ The runtime Rust DTOs are authoritative for actual serialization. The driver DTO
 shows how auctions are constructed. OpenAPI remains useful documentation, but it
 is not allowed to override runtime DTO behavior when they disagree.
 
-Two reviewed discrepancies matter immediately:
+Three reviewed discrepancies matter immediately:
 
 1. OpenAPI describes `Solution.interactions[].id` as a number, while the runtime
    solution DTO deserializes it as a string. The engine now preserves and emits
    the auction's opaque string ID.
 2. The runtime solution DTO requires `internalize: bool`. The engine now emits an
    explicit boolean even when the value is false.
+3. The runtime notification DTO makes `auctionId` and `solutionId` optional and
+   defines `solutionId` as one `u64` or a merged `u64[]`. Both forms are
+   preserved without floating-point conversion.
 
 ## Retained fixtures
 
@@ -72,8 +75,8 @@ committed vectors differ.
 ## Drift and pin governance
 
 The normal CI path is fully offline and validates the accepted pin, fixtures,
-replay and arithmetic vectors. A separate weekly/manual workflow compares the
-five authoritative files on upstream `main` against the accepted blobs and fails
+replay and arithmetic vectors. a separate weekly/manual workflow compares the
+six authoritative files on upstream `main` against the accepted blobs and fails
 when they drift.
 
 Changing the accepted pin requires a dedicated pull request with:

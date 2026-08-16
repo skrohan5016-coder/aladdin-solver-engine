@@ -2,6 +2,7 @@
   "authorityOrder": [
     "runtime-auction-dto",
     "runtime-solution-dto",
+    "runtime-notification-dto",
     "driver-auction-serialization",
     "documented-http-contract"
   ],
@@ -21,6 +22,11 @@
       "blob": "6c82fd4e461a32d73453feb68d79686642f802d6",
       "path": "crates/solvers-dto/src/auction.rs",
       "role": "runtime-auction-dto"
+    },
+    {
+      "blob": "dbbff28c235d3ba7fc559d774ba06a305385fffb",
+      "path": "crates/solvers-dto/src/notification.rs",
+      "role": "runtime-notification-dto"
     },
     {
       "blob": "816486e47ba0ac8d19da8a31ee722c103ee6c416",
@@ -45,6 +51,12 @@
       "openapi": "optional",
       "rule": "always emit explicit boolean",
       "runtimeDto": "required bool"
+    },
+    {
+      "field": "Notification.solutionId",
+      "openapi": "number",
+      "rule": "accept optional single or merged uint64 IDs losslessly; runtime DTO is authoritative",
+      "runtimeDto": "u64 | u64[] | null"
     }
   ],
   "repository": "cowprotocol/services",

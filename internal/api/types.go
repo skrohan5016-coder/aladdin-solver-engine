@@ -8,7 +8,9 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strconv"
 )
 
 // ---------- Auction (driver -> solver) ----------
@@ -126,11 +128,102 @@ type Interaction struct {
 	Internalize  bool   `json:"internalize"`
 }
 
+// ---------- Notification (driver -> solver) ----------
+
+// Notification follows the accepted runtime DTO. AuctionID and SolutionID are
+// optional; SolutionID is either one u64 or a merged u64 array.
 type Notification struct {
-	AuctionID  string                     `json:"auctionId"`
-	SolutionID json.Number                `json:"solutionId"`
+	AuctionID  *string                    `json:"auctionId"`
+	SolutionID *NotificationSolutionID    `json:"solutionId"`
 	Kind       string                     `json:"kind"`
 	Extra      map[string]json.RawMessage `json:"-"`
+}
+
+type NotificationSolutionID struct {
+	single *uint64
+	merged []uint64
+}
+
+func NewSingleNotificationSolutionID(value uint64) *NotificationSolutionID {
+	return &NotificationSolutionID{single: &value}
+}
+
+func NewMergedNotificationSolutionID(values ...uint64) *NotificationSolutionID {
+	copied := append([]uint64(nil), values...)
+	if copied == nil {
+		copied = []uint64{}
+	}
+	return &NotificationSolutionID{merged: copied}
+}
+
+func (id *NotificationSolutionID) UnmarshalJSON(data []byte) error {
+	if id == nil {
+		return errors.New("notification solution id receiver is nil")
+	}
+	*id = NotificationSolutionID{}
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return errors.New("notification solution id must be uint64 or uint64 array")
+	}
+	if trimmed[0] == '[' {
+		var items []json.RawMessage
+		if err := json.Unmarshal(trimmed, &items); err != nil {
+			return fmt.Errorf("decode merged notification solution ids: %w", err)
+		}
+		values := make([]uint64, len(items))
+		for index, item := range items {
+			if bytes.Equal(bytes.TrimSpace(item), []byte("null")) {
+				return fmt.Errorf("decode merged notification solution id %d: null is not uint64", index)
+			}
+			if err := json.Unmarshal(item, &values[index]); err != nil {
+				return fmt.Errorf("decode merged notification solution id %d: %w", index, err)
+			}
+		}
+		if items == nil {
+			values = []uint64{}
+		}
+		id.merged = values
+		return nil
+	}
+	var value uint64
+	if err := json.Unmarshal(trimmed, &value); err != nil {
+		return fmt.Errorf("decode notification solution id: %w", err)
+	}
+	id.single = &value
+	return nil
+}
+
+func (id NotificationSolutionID) MarshalJSON() ([]byte, error) {
+	switch {
+	case id.single != nil && id.merged == nil:
+		return json.Marshal(*id.single)
+	case id.single == nil && id.merged != nil:
+		return json.Marshal(id.merged)
+	default:
+		return nil, errors.New("notification solution id has an invalid representation")
+	}
+}
+
+func (id *NotificationSolutionID) String() string {
+	if id == nil {
+		return ""
+	}
+	data, err := json.Marshal(id)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func (n Notification) AuctionIDString() string {
+	if n.AuctionID == nil {
+		return ""
+	}
+	return *n.AuctionID
+}
+
+func (n Notification) SolutionIDString() string {
+	return n.SolutionID.String()
 }
 
 func (n *Notification) UnmarshalJSON(data []byte) error {
@@ -139,41 +232,48 @@ func (n *Notification) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &fields); err != nil {
 		return err
 	}
-	raw, err := takeRequiredNotificationField(fields, "auctionId")
-	if err != nil {
+	if raw, ok := fields["auctionId"]; ok {
+		if !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			var value string
+			if err := json.Unmarshal(raw, &value); err != nil {
+				return fmt.Errorf("decode notification auctionId: %w", err)
+			}
+			if _, err := strconv.ParseInt(value, 10, 64); err != nil {
+				return fmt.Errorf("decode notification auctionId: %w", err)
+			}
+			n.AuctionID = &value
+		}
+		delete(fields, "auctionId")
+	}
+	if raw, ok := fields["solutionId"]; ok {
+		if !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			var value NotificationSolutionID
+			if err := json.Unmarshal(raw, &value); err != nil {
+				return err
+			}
+			n.SolutionID = &value
+		}
+		delete(fields, "solutionId")
+	}
+	rawKind, ok := fields["kind"]
+	if !ok || bytes.Equal(bytes.TrimSpace(rawKind), []byte("null")) {
+		return errors.New("notification: missing or null required field \"kind\"")
+	}
+	if err := json.Unmarshal(rawKind, &n.Kind); err != nil {
 		return err
 	}
-	if err := json.Unmarshal(raw, &n.AuctionID); err != nil {
-		return err
+	if n.Kind == "" {
+		return errors.New("notification kind is empty")
 	}
-	raw, err = takeRequiredNotificationField(fields, "solutionId")
-	if err != nil {
-		return err
-	}
-	if err := json.Unmarshal(raw, &n.SolutionID); err != nil {
-		return err
-	}
-	raw, err = takeRequiredNotificationField(fields, "kind")
-	if err != nil {
-		return err
-	}
-	if err := json.Unmarshal(raw, &n.Kind); err != nil {
-		return err
-	}
+	delete(fields, "kind")
 	n.Extra = fields
 	return nil
 }
 
-func takeRequiredNotificationField(fields map[string]json.RawMessage, name string) (json.RawMessage, error) {
-	raw, ok := fields[name]
-	if !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-		return nil, fmt.Errorf("notification: missing or null required field %q", name)
-	}
-	delete(fields, name)
-	return raw, nil
-}
-
 func (n Notification) MarshalJSON() ([]byte, error) {
+	if n.Kind == "" {
+		return nil, errors.New("notification kind is empty")
+	}
 	fields := make(map[string]json.RawMessage, len(n.Extra)+3)
 	for key, value := range n.Extra {
 		fields[key] = value
@@ -189,11 +289,7 @@ func (n Notification) MarshalJSON() ([]byte, error) {
 	if err := put("auctionId", n.AuctionID); err != nil {
 		return nil, err
 	}
-	solutionID := n.SolutionID
-	if solutionID == "" {
-		solutionID = json.Number("0")
-	}
-	if err := put("solutionId", solutionID); err != nil {
+	if err := put("solutionId", n.SolutionID); err != nil {
 		return nil, err
 	}
 	if err := put("kind", n.Kind); err != nil {

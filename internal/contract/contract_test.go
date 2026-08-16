@@ -77,3 +77,45 @@ func TestNormalizationIsOrderIndependent(t *testing.T) {
 		t.Fatalf("normalization differs: %s != %s", left, right)
 	}
 }
+
+func TestNotificationMatchesPinnedRuntimeDTO(t *testing.T) {
+	for _, data := range []string{
+		`{"kind":"timeout"}`,
+		`{"auctionId":null,"solutionId":null,"kind":"timeout"}`,
+		`{"auctionId":"42","solutionId":7,"kind":"success","transaction":"0x01"}`,
+		`{"auctionId":"42","solutionId":[7,9007199254740993],"kind":"settlementStarted"}`,
+	} {
+		if err := ValidateNotificationJSON([]byte(data)); err != nil {
+			t.Errorf("runtime-compatible notification was rejected: %s: %v", data, err)
+		}
+	}
+	for _, data := range []string{
+		`{"auctionId":"42","solutionId":1}`,
+		`{"auctionId":42,"solutionId":1,"kind":"success"}`,
+		`{"auctionId":"not-an-i64","solutionId":1,"kind":"success"}`,
+		`{"solutionId":"1","kind":"success"}`,
+		`{"solutionId":-1,"kind":"success"}`,
+		`{"solutionId":[1,null],"kind":"success"}`,
+		`{"solutionId":18446744073709551616,"kind":"success"}`,
+		`{"kind":null}`,
+	} {
+		if err := ValidateNotificationJSON([]byte(data)); err == nil {
+			t.Errorf("invalid runtime notification was accepted: %s", data)
+		}
+	}
+}
+
+func TestRequiredScalarNullsFailClosed(t *testing.T) {
+	var value map[string]any
+	if err := json.Unmarshal(fixture(t, "auction-direct.json"), &value); err != nil {
+		t.Fatal(err)
+	}
+	value["effectiveGasPrice"] = nil
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateAuctionJSON(data); err == nil {
+		t.Fatal("null required scalar was accepted")
+	}
+}
