@@ -62,6 +62,22 @@ func TestNotificationPreservesSolutionIDAboveFloatRange(t *testing.T) {
 	}
 }
 
+func TestNotificationRejectsMissingOrNullCoreFields(t *testing.T) {
+	for _, input := range []string{
+		`{"solutionId":1,"kind":"success"}`,
+		`{"auctionId":"42","kind":"success"}`,
+		`{"auctionId":"42","solutionId":1}`,
+		`{"auctionId":null,"solutionId":1,"kind":"success"}`,
+		`{"auctionId":"42","solutionId":null,"kind":"success"}`,
+		`{"auctionId":"42","solutionId":1,"kind":null}`,
+	} {
+		var notification Notification
+		if err := json.Unmarshal([]byte(input), &notification); err == nil {
+			t.Errorf("invalid notification was accepted: %s", input)
+		}
+	}
+}
+
 func TestNotificationUnmarshalReplacesPreviousState(t *testing.T) {
 	notification := Notification{
 		AuctionID:  "old",
@@ -69,10 +85,10 @@ func TestNotificationUnmarshalReplacesPreviousState(t *testing.T) {
 		Kind:       "old",
 		Extra:      map[string]json.RawMessage{"stale": json.RawMessage(`true`)},
 	}
-	if err := json.Unmarshal([]byte(`{"auctionId":"new","kind":"success"}`), &notification); err != nil {
+	if err := json.Unmarshal([]byte(`{"auctionId":"new","solutionId":0,"kind":"success"}`), &notification); err != nil {
 		t.Fatal(err)
 	}
-	if notification.AuctionID != "new" || notification.SolutionID != "" || notification.Kind != "success" {
+	if notification.AuctionID != "new" || notification.SolutionID.String() != "0" || notification.Kind != "success" {
 		t.Fatalf("old core state survived unmarshal: %+v", notification)
 	}
 	if _, ok := notification.Extra["stale"]; ok {
