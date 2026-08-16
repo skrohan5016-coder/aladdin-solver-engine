@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	maxStablePoolTokens = 64
+	maxStablePoolTokens  = 64
 	maxConcentratedTicks = 16_384
 	maxWireDecimalLength = 128
 )
