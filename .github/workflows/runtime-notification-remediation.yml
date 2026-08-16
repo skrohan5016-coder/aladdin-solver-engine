@@ -1,0 +1,59 @@
+name: runtime-notification-remediation
+
+on:
+  push:
+    branches:
+      - agent/phase1-wire-contract-v1
+
+permissions:
+  contents: write
+
+concurrency:
+  group: runtime-notification-remediation-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  remediate:
+    if: startsWith(github.event.head_commit.message, '[runtime-notification-remediation]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out Phase 1 branch
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: agent/phase1-wire-contract-v1
+          fetch-depth: 0
+
+      - name: Set up pinned Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Apply and validate runtime notification remediation
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          set -euo pipefail
+          cat scripts/.runtime-notification-remediation.* > /tmp/runtime_notification_remediation.py
+          python3 /tmp/runtime_notification_remediation.py
+          rm scripts/.runtime-notification-remediation.*
+          rm .github/workflows/runtime-notification-remediation.yml
+          find . -type f -name '*.go' -print0 | xargs -0 gofmt -w
+          python3 scripts/check_contract_fixtures.py
+          python3 scripts/check_upstream_pin.py
+          python3 scripts/generate_reference_vectors.py --check
+          go test -count=1 ./internal/api ./internal/contract ./internal/record ./internal/server ./cmd/report ./cmd/contractcheck
+          go test -race -count=1 ./internal/api ./internal/contract ./internal/record ./internal/server ./cmd/report ./cmd/contractcheck
+          git diff --check
+
+      - name: Commit validated clean tree
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          test -n "$(git diff --cached --name-only)"
+          git diff --cached --check
+          git commit -m "fix: match pinned runtime notification DTO"
+          git push origin HEAD:agent/phase1-wire-contract-v1

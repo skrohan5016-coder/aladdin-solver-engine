@@ -1,0 +1,72 @@
+ss"}`,
+		`{"auctionId":"42","solutionId":"1","kind":"success"}`,
+		`{"auctionId":"42","solutionId":[1,null],"kind":"success"}`,
+		`{"auctionId":"42","solutionId":-1,"kind":"success"}`,
+		`{"auctionId":"42","solutionId":1,"kind":null}`,
+	} {
+		var notification Notification
+		if err := json.Unmarshal([]byte(input), &notification); err == nil {
+			t.Errorf("invalid notification was accepted: %s", input)
+		}
+	}
+}
+'''
+test_path.write_text(before + optional_test + end + after)
+replace_once(
+    "internal/api/types_test.go",
+    '''\tnotification := Notification{
+\t\tAuctionID:  "old",
+\t\tSolutionID: json.Number("9"),
+''',
+    '''\toldAuction := "old"
+\tnotification := Notification{
+\t\tAuctionID:  &oldAuction,
+\t\tSolutionID: NewSingleNotificationSolutionID(9),
+''',
+)
+replace_once(
+    "internal/api/types_test.go",
+    'json.Unmarshal([]byte(`{"auctionId":"new","solutionId":0,"kind":"success"}`), &notification)',
+    'json.Unmarshal([]byte(`{"kind":"success"}`), &notification)',
+)
+replace_once(
+    "internal/api/types_test.go",
+    'notification.AuctionID != "new" || notification.SolutionID.String() != "0"',
+    'notification.AuctionID != nil || notification.SolutionID != nil',
+)
+
+replace_once(
+    "internal/record/record_test.go",
+    '''\t\tAuctionID:  auctionID,
+\t\tSolutionID: json.Number("7"),
+''',
+    '''\t\tAuctionID:  &auctionID,
+\t\tSolutionID: api.NewSingleNotificationSolutionID(7),
+''',
+)
+replace_once(
+    "internal/record/record_test.go",
+    'notificationRecord.Notify.SolutionID.String()',
+    'notificationRecord.Notify.SolutionIDString()',
+)
+replace_once("internal/record/record_test.go", 'api.Notification{AuctionID: "a", Kind: "success"}', 'api.Notification{Kind: "success"}')
+replace_once("internal/record/record_test.go", 'api.Notification{AuctionID: "b", Kind: "success"}', 'api.Notification{Kind: "success"}')
+replace_once(
+    "cmd/report/main.go",
+    '''\tNotify struct {
+\t\tAuctionID string  `json:"auctionId"`
+\t\tSolution  float64 `json:"solutionId"`
+\t\tKind      string  `json:"kind"`
+\t} `json:"notify"`
+''',
+    '''\tNotify struct {
+\t\tKind string `json:"kind"`
+\t} `json:"notify"`
+''',
+)
+replace_once("internal/server/server.go", '"auction", notification.AuctionID,\n\t\t"solution", notification.SolutionID,', '"auction", notification.AuctionIDString(),\n\t\t"solution", notification.SolutionIDString(),')
+
+contract_tests = ROOT / "internal/contract/contract_test.go"
+contract_tests.write_text(contract_tests.read_text() + r'''
+
+func TestNotifica
