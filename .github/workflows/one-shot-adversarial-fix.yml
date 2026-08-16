@@ -1,0 +1,44 @@
+name: one-shot-adversarial-fix
+
+on:
+  push:
+    branches:
+      - agent/recover-shadow-engine-v1
+
+permissions:
+  contents: write
+
+jobs:
+  remediate:
+    if: startsWith(github.event.head_commit.message, '[autofix-trigger]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out recovery branch
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: agent/recover-shadow-engine-v1
+          fetch-depth: 0
+
+      - name: Set up pinned Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Apply, format, and validate remediation
+        run: |
+          python3 scripts/one_shot_adversarial_fix.py
+          rm scripts/one_shot_adversarial_fix.py
+          rm .github/workflows/one-shot-adversarial-fix.yml
+          find . -type f -name '*.go' -print0 | xargs -0 gofmt -w
+          bash scripts/ci.sh
+
+      - name: Commit validated remediation
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git diff --cached --check
+          git commit -m "fix: close adversarial correctness gaps"
+          git push origin HEAD:agent/recover-shadow-engine-v1
