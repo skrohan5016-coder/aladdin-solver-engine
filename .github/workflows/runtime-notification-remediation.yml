@@ -35,9 +35,10 @@ jobs:
           GOTOOLCHAIN: local
         run: |
           set -euo pipefail
-          cat scripts/.runtime-notification-remediation.* > /tmp/runtime_notification_remediation.py
-          python3 /tmp/runtime_notification_remediation.py
+          cat scripts/.runtime-notification-remediation.* > scripts/runtime_notification_remediation.py
+          python3 scripts/runtime_notification_remediation.py
           rm scripts/.runtime-notification-remediation.*
+          rm scripts/runtime_notification_remediation.py
           rm .github/workflows/runtime-notification-remediation.yml
           find . -type f -name '*.go' -print0 | xargs -0 gofmt -w
           python3 scripts/check_contract_fixtures.py
