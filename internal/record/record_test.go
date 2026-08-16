@@ -32,7 +32,7 @@ func TestRecorderWritesVersionedPrivateEvidence(t *testing.T) {
 	}
 	notification := api.Notification{
 		AuctionID:  auctionID,
-		SolutionID: 7,
+		SolutionID: json.Number("7"),
 		Kind:       "success",
 		Extra: map[string]json.RawMessage{
 			"rank": json.RawMessage(`2`),
@@ -69,6 +69,9 @@ func TestRecorderWritesVersionedPrivateEvidence(t *testing.T) {
 	}
 	if notificationRecord.Schema != NotificationRecordSchema {
 		t.Fatalf("unexpected notification schema %q", notificationRecord.Schema)
+	}
+	if notificationRecord.Notify.SolutionID.String() != "7" {
+		t.Fatalf("notification solution id changed: %+v", notificationRecord.Notify)
 	}
 	if _, ok := notificationRecord.Notify.Extra["rank"]; !ok {
 		t.Fatalf("notification metadata was lost: %+v", notificationRecord.Notify)
