@@ -8,6 +8,9 @@ on:
 permissions:
   contents: write
 
+env:
+  GOTOOLCHAIN: local
+
 concurrency:
   group: phase1-wire-contract-build
   cancel-in-progress: true
@@ -30,14 +33,16 @@ jobs:
           go-version-file: go.mod
           cache: false
 
-      - name: Build and validate Phase 1
+      - name: Verify, apply, and validate Phase 1
         run: |
-          cat scripts/.phase1_apply.b64.* | base64 -d > scripts/phase1_apply.py
+          cat scripts/.phase1_payload.b64.* | base64 -d > /tmp/phase1_apply.py.gz
+          echo "930e701106c7529f15f8b54e5333879ef1a347c6a2af890d2445e945c5a025b9  /tmp/phase1_apply.py.gz" | sha256sum -c -
+          gzip -dc /tmp/phase1_apply.py.gz > scripts/phase1_apply.py
+          echo "27dcf21bdf69808e4afb10700fa1ba102c17a1e431e378a31e00d36f2a6bdc87  scripts/phase1_apply.py" | sha256sum -c -
           chmod +x scripts/phase1_apply.py
           python3 scripts/phase1_apply.py
-          rm scripts/phase1_apply.py scripts/.phase1_apply.b64.*
-          rm .github/workflows/phase1-wire-contract-build.yml
-          rm .phase1-trigger
+          rm -f scripts/phase1_apply.py scripts/.phase1_payload.b64.* scripts/.phase1_apply.b64.*
+          rm -f .github/workflows/phase1-wire-contract-build.yml .phase1-trigger
           python3 scripts/generate_reference_vectors.py --write
           find . -type f -name '*.go' -print0 | xargs -0 gofmt -w
           git diff --check
@@ -47,6 +52,9 @@ jobs:
         run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          test ! -e .phase1-trigger
+          test ! -e .github/workflows/phase1-wire-contract-build.yml
+          test -z "$(find scripts -maxdepth 1 -type f \( -name '.phase1_*' -o -name 'phase1_apply.py' \) -print)"
           git add -A
           git diff --cached --check
           git commit -m "feat: continuously verify the CoW wire contract"
