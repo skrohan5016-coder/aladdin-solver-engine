@@ -129,6 +129,29 @@ else
   fail "missing upstream solver-contract pin"
 fi
 
+section "Repository cleanliness"
+temporary_paths=(
+  ".phase1-review-trigger"
+  "scripts/.phase1_review_fix.py.gz"
+  "scripts/phase1_acceptance.py"
+  "scripts/phase1_builder.py"
+)
+temporary_hits=()
+for path in "${temporary_paths[@]}"; do
+  if [ -e "$path" ]; then
+    temporary_hits+=("$path")
+  fi
+done
+while IFS= read -r path; do
+  temporary_hits+=("$path")
+done < <(find .github/workflows -maxdepth 1 -type f -name 'phase1-*' -print | sort)
+if [ "${#temporary_hits[@]}" -eq 0 ]; then
+  pass "no temporary Phase 1 automation or payloads"
+else
+  printf '%s\n' "${temporary_hits[@]}"
+  fail "temporary Phase 1 automation or payloads remain"
+fi
+
 section "Deployment boundary"
 if grep -q 'LISTEN_ADDR=127.0.0.1:8000' deploy/solver.service &&
   grep -q 'IPAddressDeny=any' deploy/solver.service; then
