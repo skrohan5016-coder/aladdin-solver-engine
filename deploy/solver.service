@@ -1,0 +1,32 @@
+# Install: sudo cp deploy/solver.service /etc/systemd/system/
+#          sudo systemctl daemon-reload && sudo systemctl enable --now solver
+[Unit]
+Description=CoW solver engine (shadow)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=solver
+WorkingDirectory=/opt/solver
+ExecStart=/opt/solver/bin/solver
+Restart=always
+RestartSec=5
+
+Environment=LISTEN_ADDR=127.0.0.1:8000
+Environment=RECORD_DIR=/opt/solver/data
+Environment=LOG_LEVEL=info
+Environment=REQUIRE_PROFITABLE=true
+
+# This process needs no privileges. It holds no keys and writes only its
+# own data directory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/solver/data
+CapabilityBoundingSet=
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target
