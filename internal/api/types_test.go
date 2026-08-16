@@ -57,12 +57,12 @@ func TestNotificationUnmarshalReplacesPreviousState(t *testing.T) {
 	}
 }
 
-func TestInteractionIDMustBeDecimal(t *testing.T) {
-	valid := Interaction{
-		Kind: "liquidity", ID: "7", InputToken: "0xa", OutputToken: "0xb",
-		InputAmount: "1", OutputAmount: "1",
+func TestInteractionPreservesOpaqueIDAndExplicitInternalize(t *testing.T) {
+	interaction := Interaction{
+		Kind: "liquidity", ID: "pool/opaque/7", InputToken: "0xa", OutputToken: "0xb",
+		InputAmount: "1", OutputAmount: "1", Internalize: false,
 	}
-	encoded, err := json.Marshal(valid)
+	encoded, err := json.Marshal(interaction)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,13 +70,10 @@ func TestInteractionIDMustBeDecimal(t *testing.T) {
 	if err := json.Unmarshal(encoded, &wire); err != nil {
 		t.Fatal(err)
 	}
-	if id, ok := wire["id"].(float64); !ok || id != 7 {
-		t.Fatalf("liquidity id is not a JSON number: %#v", wire["id"])
+	if id, ok := wire["id"].(string); !ok || id != interaction.ID {
+		t.Fatalf("liquidity id was not preserved as an opaque string: %#v", wire["id"])
 	}
-
-	invalid := valid
-	invalid.ID = "pool-seven"
-	if _, err := json.Marshal(invalid); err == nil {
-		t.Fatal("non-decimal liquidity id must not be emitted")
+	if internalize, ok := wire["internalize"].(bool); !ok || internalize {
+		t.Fatalf("internalize=false was omitted or changed: %#v", wire["internalize"])
 	}
 }

@@ -65,12 +65,12 @@ func TestDuplicateNestedFieldRejected(t *testing.T) {
 	}
 }
 
-func TestNonNumericLiquidityIDRejected(t *testing.T) {
+func TestOpaqueLiquidityIDAccepted(t *testing.T) {
 	deadline := time.Now().Add(10 * time.Second).UTC().Format(time.RFC3339)
 	payload := strings.Replace(auctionJSON(deadline), `"id": "7"`, `"id": "pool-seven"`, 1)
 	response := post(t, testServer(t), "/solve", payload)
-	if response.Code != http.StatusBadRequest {
-		t.Fatalf("non-numeric liquidity id returned %d, want 400", response.Code)
+	if response.Code != http.StatusOK {
+		t.Fatalf("opaque liquidity id returned %d, want 200: %s", response.Code, response.Body.String())
 	}
 }
 

@@ -1,0 +1,38 @@
+{
+  "fixtures": [
+    {
+      "kind": "auction",
+      "path": "auction-all-liquidity.json",
+      "sha256": "288e3d13c0359224bd1d6c1ad623c97c594eb26048329a3a3db3e78b55f9baee"
+    },
+    {
+      "kind": "auction",
+      "path": "auction-direct.json",
+      "sha256": "77ed388554e3f3e8e83d14db304c553189ec86fc23c41da46cdd81fcb8b3117b"
+    },
+    {
+      "kind": "notification",
+      "path": "notification-extra.json",
+      "sha256": "3b2462dbf34ca49e9b9c340e3aba9fda53bf3b6149875c267cb715d88807a1eb"
+    },
+    {
+      "kind": "solution",
+      "path": "solution-direct.json",
+      "sha256": "4eaca55dd70c99fe37d5e1ca1aac6672d24bff9be2a28f6e995da13f29cae875"
+    }
+  ],
+  "notificationRoundTrips": [
+    "notification-extra.json"
+  ],
+  "replayPairs": [
+    {
+      "auction": "auction-direct.json",
+      "solution": "solution-direct.json"
+    }
+  ],
+  "schema": "aladdin-contract-fixture-manifest/v1",
+  "upstream": {
+    "commit": "20b3a62f222ad278502fb7e85cae4938e7f26f65",
+    "repository": "cowprotocol/services"
+  }
+}

@@ -5,11 +5,7 @@
 // parsed into floats anywhere in this codebase.
 package api
 
-import (
-	"encoding/json"
-	"fmt"
-	"strconv"
-)
+import "encoding/json"
 
 // ---------- Auction (driver -> solver) ----------
 
@@ -36,7 +32,7 @@ type Order struct {
 	SellToken         string            `json:"sellToken"`
 	BuyToken          string            `json:"buyToken"`
 	SellAmount        string            `json:"sellAmount"`
-	FullSellAmount    string            `json:"fullSellAmount,omitempty"`
+	FullSellAmount    string            `json:"fullSellAmount"`
 	BuyAmount         string            `json:"buyAmount"`
 	FullBuyAmount     string            `json:"fullBuyAmount"`
 	FeePolicies       []FeePolicy       `json:"feePolicies,omitempty"`
@@ -58,9 +54,16 @@ type Order struct {
 }
 
 type FeePolicy struct {
-	Kind            string   `json:"kind"`
-	Factor          *float64 `json:"factor,omitempty"`
-	MaxVolumeFactor *float64 `json:"maxVolumeFactor,omitempty"`
+	Kind            string    `json:"kind"`
+	Factor          *float64  `json:"factor,omitempty"`
+	MaxVolumeFactor *float64  `json:"maxVolumeFactor,omitempty"`
+	Quote           *FeeQuote `json:"quote,omitempty"`
+}
+
+type FeeQuote struct {
+	SellAmount string `json:"sellAmount"`
+	BuyAmount  string `json:"buyAmount"`
+	Fee        string `json:"fee"`
 }
 
 // Liquidity is the flattened union of every pool kind the driver may send.
@@ -76,14 +79,24 @@ type Liquidity struct {
 	Fee    string          `json:"fee"`
 	Router string          `json:"router,omitempty"`
 
-	// stable
+	// Balancer stable / weighted product
 	AmplificationParameter string `json:"amplificationParameter,omitempty"`
+	BalancerPoolID         string `json:"balancerPoolId,omitempty"`
+	Version                string `json:"version,omitempty"`
 
 	// concentratedLiquidity
 	SqrtPrice    string            `json:"sqrtPrice,omitempty"`
 	Liquidity    string            `json:"liquidity,omitempty"`
 	Tick         *int32            `json:"tick,omitempty"`
 	LiquidityNet map[string]string `json:"liquidityNet,omitempty"`
+
+	// foreign limit order
+	Hash                string `json:"hash,omitempty"`
+	MakerToken          string `json:"makerToken,omitempty"`
+	TakerToken          string `json:"takerToken,omitempty"`
+	MakerAmount         string `json:"makerAmount,omitempty"`
+	TakerAmount         string `json:"takerAmount,omitempty"`
+	TakerTokenFeeAmount string `json:"takerTokenFeeAmount,omitempty"`
 }
 
 type TokenReserve struct {
@@ -111,29 +124,16 @@ type Trade struct {
 	Fee            string `json:"fee,omitempty"`
 }
 
-// Interaction is a liquidity interaction. The driver currently serializes
-// auction liquidity identifiers as decimal strings but requires the solution
-// identifier as a JSON number.
+// Interaction mirrors the runtime Rust solution DTO. Liquidity IDs remain
+// opaque strings, and internalize is always emitted explicitly.
 type Interaction struct {
 	Kind         string `json:"kind"` // "liquidity"
-	ID           string `json:"-"`
+	ID           string `json:"id"`
 	InputToken   string `json:"inputToken"`
 	OutputToken  string `json:"outputToken"`
 	InputAmount  string `json:"inputAmount"`
 	OutputAmount string `json:"outputAmount"`
-	Internalize  bool   `json:"internalize,omitempty"`
-}
-
-func (i Interaction) MarshalJSON() ([]byte, error) {
-	type alias Interaction
-	n, err := strconv.ParseUint(i.ID, 10, 64)
-	if err != nil {
-		return nil, fmt.Errorf("liquidity id %q is not a decimal uint64: %w", i.ID, err)
-	}
-	return json.Marshal(struct {
-		ID uint64 `json:"id"`
-		alias
-	}{ID: n, alias: alias(i)})
+	Internalize  bool   `json:"internalize"`
 }
 
 // ---------- Notification (driver -> solver) ----------

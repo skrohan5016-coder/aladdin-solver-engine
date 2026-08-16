@@ -1,0 +1,52 @@
+{
+  "authorityOrder": [
+    "runtime-auction-dto",
+    "runtime-solution-dto",
+    "driver-auction-serialization",
+    "documented-http-contract"
+  ],
+  "commit": "20b3a62f222ad278502fb7e85cae4938e7f26f65",
+  "files": [
+    {
+      "blob": "f857f86838ce8a2a0b9ab0c7185e23eb4c8bcb9f",
+      "path": "crates/driver/src/infra/solver/dto/auction.rs",
+      "role": "driver-auction-serialization"
+    },
+    {
+      "blob": "3d181998518804abe621f739c033f0e0d75d9dd1",
+      "path": "crates/liquidity-sources/src/balancer_v2/swap/stable_math.rs",
+      "role": "stable-math-reference"
+    },
+    {
+      "blob": "6c82fd4e461a32d73453feb68d79686642f802d6",
+      "path": "crates/solvers-dto/src/auction.rs",
+      "role": "runtime-auction-dto"
+    },
+    {
+      "blob": "816486e47ba0ac8d19da8a31ee722c103ee6c416",
+      "path": "crates/solvers-dto/src/solution.rs",
+      "role": "runtime-solution-dto"
+    },
+    {
+      "blob": "64a2466292446ea5f637c809f754fb4a31211a16",
+      "path": "crates/solvers/openapi.yml",
+      "role": "documented-http-contract"
+    }
+  ],
+  "knownDiscrepancies": [
+    {
+      "field": "Solution.interactions[].id",
+      "openapi": "number",
+      "rule": "emit string; runtime DTO is authoritative",
+      "runtimeDto": "string"
+    },
+    {
+      "field": "Solution.interactions[].internalize",
+      "openapi": "optional",
+      "rule": "always emit explicit boolean",
+      "runtimeDto": "required bool"
+    }
+  ],
+  "repository": "cowprotocol/services",
+  "schema": "aladdin-upstream-pin/v1"
+}

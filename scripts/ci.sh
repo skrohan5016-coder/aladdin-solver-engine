@@ -52,6 +52,15 @@ else
   fail "go.mod must pin go 1.24.13"
 fi
 
+section "Pinned wire contract"
+run_gate "fixture byte digests" python3 scripts/check_contract_fixtures.py
+run_gate "upstream pin consistency" python3 scripts/check_upstream_pin.py
+run_gate "independent arithmetic vectors" python3 scripts/generate_reference_vectors.py --check
+run_gate "contract fixtures and replay" go run ./cmd/contractcheck -dir testdata/contracts
+run_gate "pin-change governance" python3 scripts/check_pin_change.py
+run_gate "workflow action pins" python3 scripts/check_workflow_pins.py
+run_gate "Python helper syntax" python3 -m py_compile scripts/check_contract_fixtures.py scripts/check_pin_change.py scripts/check_upstream_drift.py scripts/check_upstream_pin.py scripts/check_workflow_pins.py scripts/generate_reference_vectors.py
+
 section "Static analysis"
 run_gate "go vet" go vet ./...
 
@@ -60,7 +69,7 @@ run_gate "go test" go test -count=1 ./...
 run_gate "go test -race" go test -race -count=1 ./...
 
 section "Build"
-run_gate "solver and report build" go build -trimpath ./cmd/solver ./cmd/report
+run_gate "solver, report and contractcheck build" go build -trimpath ./cmd/solver ./cmd/report ./cmd/contractcheck
 if grep -q '^FROM golang:1.24.13-alpine3.22@sha256:3641e0d9b931dc4f2f185dcd669c4679670e9277c8166a838ddb98a2d4389cb5 AS build$' Dockerfile &&
   grep -q '^FROM scratch$' Dockerfile; then
   pass "container bases are immutable"

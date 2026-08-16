@@ -10,11 +10,11 @@ import (
 	"log/slog"
 	"math/big"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/api"
+	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/contract"
 	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/record"
 	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/solve"
 )
@@ -133,6 +133,13 @@ func (s *Server) writeJSON(w http.ResponseWriter, value any) {
 		http.Error(w, "encode response", http.StatusInternalServerError)
 		return
 	}
+	if _, ok := value.(api.SolveResponse); ok {
+		if err := contract.ValidateSolveResponseJSON(data); err != nil {
+			s.log.Error("response violates pinned wire contract", "err", err)
+			http.Error(w, "invalid solver response", http.StatusInternalServerError)
+			return
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
 	data = append(data, '\n')
 	if _, err := w.Write(data); err != nil {
@@ -178,36 +185,17 @@ func validateAuction(auction *api.Auction) error {
 		}
 		seenOrderUIDs[uid] = struct{}{}
 	}
-	seenLiquidityIDs := map[uint64]struct{}{}
+	seenLiquidityIDs := map[string]struct{}{}
 	for i, liquidity := range auction.Liquidity {
-		if !routableLiquidityKind(liquidity.Kind) {
-			continue
+		if liquidity.ID == "" {
+			return fmt.Errorf("empty liquidity id at index %d", i)
 		}
-		if !decimalDigits(liquidity.ID, 20) {
-			return fmt.Errorf("invalid liquidity id at index %d", i)
+		if _, duplicate := seenLiquidityIDs[liquidity.ID]; duplicate {
+			return fmt.Errorf("duplicate liquidity id %q", liquidity.ID)
 		}
-		id, err := strconv.ParseUint(liquidity.ID, 10, 64)
-		if err != nil {
-			return fmt.Errorf("invalid liquidity id at index %d: %w", i, err)
-		}
-		if strconv.FormatUint(id, 10) != liquidity.ID {
-			return fmt.Errorf("non-canonical liquidity id at index %d", i)
-		}
-		if _, duplicate := seenLiquidityIDs[id]; duplicate {
-			return fmt.Errorf("duplicate liquidity id %d", id)
-		}
-		seenLiquidityIDs[id] = struct{}{}
+		seenLiquidityIDs[liquidity.ID] = struct{}{}
 	}
 	return nil
-}
-
-func routableLiquidityKind(kind string) bool {
-	switch kind {
-	case "constantProduct", "concentratedLiquidity", "stable":
-		return true
-	default:
-		return false
-	}
 }
 
 func validU256(raw string, allowZero bool) bool {
@@ -240,6 +228,16 @@ func decodeUniqueJSON(reader io.Reader, target any) error {
 	}
 	if err := validateUniqueObjectKeys(data); err != nil {
 		return err
+	}
+	switch target.(type) {
+	case *api.Auction:
+		if err := contract.ValidateAuctionJSON(data); err != nil {
+			return err
+		}
+	case *api.Notification:
+		if err := contract.ValidateNotificationJSON(data); err != nil {
+			return err
+		}
 	}
 	return json.Unmarshal(data, target)
 }

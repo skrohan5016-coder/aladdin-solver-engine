@@ -12,8 +12,7 @@ stated evidence. The reviewed upstream source contract is pinned in
 
 ## Phase 0 — Recover a trustworthy baseline
 
-Status: implementation complete on Draft PR #2; final exact-head and merge-ref
-verification remain before human landing approval.
+Status: accepted and squash-merged as `27d0800324358c39f36f240b0fbd5920faf5ee67`.
 
 Deliverables:
 
@@ -41,6 +40,8 @@ Exit gate:
 - Rohan explicitly approves the exact final head before landing.
 
 ## Phase 1 — Continuously verify the CoW wire contract
+
+Status: active on `agent/phase1-wire-contract-v1`.
 
 Foundation already delivered in Phase 0:
 

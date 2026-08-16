@@ -1,0 +1,115 @@
+{
+  "id": null,
+  "tokens": {
+    "0x000000000000000000000000000000000000000a": {"decimals": 18, "symbol": "AAA", "referencePrice": "1000000000000000000", "availableBalance": "0", "trusted": true},
+    "0x000000000000000000000000000000000000000b": {"decimals": 18, "symbol": "BBB", "referencePrice": "1000000000000000000", "availableBalance": "0", "trusted": true},
+    "0x000000000000000000000000000000000000000c": {"decimals": 6, "symbol": "CCC", "referencePrice": null, "availableBalance": "0", "trusted": false},
+    "0x000000000000000000000000000000000000000d": {"decimals": null, "symbol": null, "referencePrice": null, "availableBalance": "0", "trusted": false}
+  },
+  "orders": [
+    {
+      "uid": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbffffffff",
+      "sellToken": "0x000000000000000000000000000000000000000a",
+      "buyToken": "0x000000000000000000000000000000000000000b",
+      "sellAmount": "1000000",
+      "fullSellAmount": "2000000",
+      "buyAmount": "900000",
+      "fullBuyAmount": "1800000",
+      "feePolicies": [
+        {"kind": "surplus", "factor": 0.5, "maxVolumeFactor": 0.05},
+        {"kind": "priceImprovement", "factor": 0.5, "maxVolumeFactor": 0.01, "quote": {"sellAmount": "1000000", "buyAmount": "910000", "fee": "1000"}},
+        {"kind": "volume", "factor": 0.001}
+      ],
+      "validTo": 4294967295,
+      "kind": "sell",
+      "receiver": "0x0000000000000000000000000000000000000004",
+      "owner": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "partiallyFillable": true,
+      "preInteractions": [{"target": "0x0000000000000000000000000000000000000005", "value": "0", "callData": "0x"}],
+      "postInteractions": [{"target": "0x0000000000000000000000000000000000000006", "value": "0", "callData": "0x"}],
+      "sellTokenSource": "erc20",
+      "buyTokenDestination": "erc20",
+      "class": "limit",
+      "appData": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "flashloanHint": {
+        "liquidityProvider": "0x0000000000000000000000000000000000000007",
+        "protocolAdapter": "0x0000000000000000000000000000000000000008",
+        "receiver": "0x0000000000000000000000000000000000000009",
+        "token": "0x000000000000000000000000000000000000000a",
+        "amount": "1000000"
+      },
+      "wrappers": [{"address": "0x0000000000000000000000000000000000000010", "data": "0x1234", "isOmittable": false}],
+      "signingScheme": "eip1271",
+      "signature": "0x1234"
+    }
+  ],
+  "liquidity": [
+    {
+      "kind": "constantProduct",
+      "id": "cp/opaque/1",
+      "address": "0x0000000000000000000000000000000000000101",
+      "gasEstimate": "90000",
+      "tokens": {
+        "0x000000000000000000000000000000000000000a": {"balance": "1000000000000000000000"},
+        "0x000000000000000000000000000000000000000b": {"balance": "1000000000000000000000"}
+      },
+      "fee": "0.003",
+      "router": "0x0000000000000000000000000000000000000102"
+    },
+    {
+      "kind": "stable",
+      "id": "stable/opaque/2",
+      "address": "0x0000000000000000000000000000000000000201",
+      "gasEstimate": "120000",
+      "tokens": {
+        "0x000000000000000000000000000000000000000a": {"balance": "1000000000000000000000000", "scalingFactor": "1"},
+        "0x000000000000000000000000000000000000000b": {"balance": "1000000000000000000000000", "scalingFactor": "1"},
+        "0x000000000000000000000000000000000000000c": {"balance": "1000000000000", "scalingFactor": "1000000000000"}
+      },
+      "amplificationParameter": "100",
+      "fee": "0.0004",
+      "balancerPoolId": "0x0000000000000000000000000000000000000201000200000000000000000001"
+    },
+    {
+      "kind": "weightedProduct",
+      "id": "weighted/opaque/3",
+      "address": "0x0000000000000000000000000000000000000301",
+      "gasEstimate": "130000",
+      "tokens": {
+        "0x000000000000000000000000000000000000000a": {"balance": "1000000000000000000000", "scalingFactor": "1", "weight": "0.5"},
+        "0x000000000000000000000000000000000000000b": {"balance": "1000000000000000000000", "scalingFactor": "1", "weight": "0.5"}
+      },
+      "fee": "0.001",
+      "version": "v0",
+      "balancerPoolId": "0x0000000000000000000000000000000000000301000200000000000000000001"
+    },
+    {
+      "kind": "concentratedLiquidity",
+      "id": "v3/opaque/4",
+      "address": "0x0000000000000000000000000000000000000401",
+      "gasEstimate": "110000",
+      "tokens": ["0x000000000000000000000000000000000000000a", "0x000000000000000000000000000000000000000b"],
+      "sqrtPrice": "79228162514264337593543950336",
+      "liquidity": "100000000000000000000",
+      "tick": 0,
+      "liquidityNet": {"-60000": "100000000000000000000", "60000": "-100000000000000000000"},
+      "fee": "0.003",
+      "router": "0x0000000000000000000000000000000000000402"
+    },
+    {
+      "kind": "limitOrder",
+      "id": "0x/opaque/5",
+      "address": "0x0000000000000000000000000000000000000501",
+      "gasEstimate": "140000",
+      "hash": "0x0000000000000000000000000000000000000000000000000000000000000502",
+      "makerToken": "0x000000000000000000000000000000000000000a",
+      "takerToken": "0x000000000000000000000000000000000000000b",
+      "makerAmount": "1000000",
+      "takerAmount": "900000",
+      "takerTokenFeeAmount": "1000"
+    }
+  ],
+  "effectiveGasPrice": "1000000000",
+  "deadline": "2099-12-31T23:59:59Z",
+  "surplusCapturingJitOrderOwners": ["0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+}

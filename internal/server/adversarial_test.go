@@ -43,21 +43,16 @@ func TestOpaqueIDAllowedForUnsupportedLiquidity(t *testing.T) {
 	}
 }
 
-func TestRoutableLiquidityIDMustBeCanonicalAndUnique(t *testing.T) {
-	for name, liquidity := range map[string][]api.Liquidity{
-		"non-canonical": {{Kind: "constantProduct", ID: "01"}},
-		"duplicate": {
-			{Kind: "constantProduct", ID: "1"},
-			{Kind: "stable", ID: "1"},
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			auction := validContractAuction()
-			auction.Liquidity = liquidity
-			if err := validateAuction(auction); err == nil {
-				t.Fatal("invalid routable liquidity ids were accepted")
-			}
-		})
+func TestLiquidityIDsAreOpaqueButUnique(t *testing.T) {
+	auction := validContractAuction()
+	auction.Liquidity = []api.Liquidity{{Kind: "constantProduct", ID: "cp/opaque/01"}}
+	if err := validateAuction(auction); err != nil {
+		t.Fatalf("opaque routable ID was rejected: %v", err)
+	}
+
+	auction.Liquidity = append(auction.Liquidity, api.Liquidity{Kind: "stable", ID: "cp/opaque/01"})
+	if err := validateAuction(auction); err == nil {
+		t.Fatal("duplicate opaque liquidity IDs were accepted")
 	}
 }
 
