@@ -41,33 +41,9 @@ jobs:
           path = Path("scripts/runtime_notification_remediation.py")
           text = path.read_text()
           replacements = {
-              'marker = "// ---------- Notification (driver -> solver) ----------\\n"':
-                  'marker = "type Notification struct {\\n"',
-              'types.write_text(prefix + marker + block)':
-                  'types.write_text(prefix + block)',
-              '''if '"strconv"' not in text:
-    text = text.replace('\\t"fmt"\\n', '\\t"fmt"\\n\\t"strconv"\\n')''':
-                  '''if '"errors"' not in text:
-    text = text.replace('\\t"encoding/json"\\n', '\\t"encoding/json"\\n\\t"errors"\\n')
-if '"strconv"' not in text:
-    text = text.replace('\\t"fmt"\\n', '\\t"fmt"\\n\\t"strconv"\\n')''',
-              '''\tdecoder := json.NewDecoder(bytes.NewReader(raw))
-\tdecoder.UseNumber()
-\tvar value json.Number
-\tif err := decoder.Decode(&value); err != nil || value.String() == "" {
-\t\treturn fmt.Errorf("%s: expected uint64", path)
-\t}
-\tif _, err := strconv.ParseUint(value.String(), 10, 64); err != nil {
-\t\treturn fmt.Errorf("%s: expected uint64: %w", path, err)
-\t}
-\treturn nil''':
-                  '''\tvar value uint64
-\tif err := json.Unmarshal(raw, &value); err != nil {
-\t\treturn fmt.Errorf("%s: expected uint64: %w", path, err)
-\t}
-\treturn nil''',
-              "'a separate weekly/manual workflow compares the\\nfive authoritative files'":
-                  "'A separate weekly/manual workflow compares the\\nfive authoritative files'",
+              'marker = "// ---------- Notification (driver -> solver) ----------\\n"': 'marker = "type Notification struct {\\n"',
+              'types.write_text(prefix + marker + block)': 'types.write_text(prefix + block)',
+              "'a separate weekly/manual workflow compares the\\nfive authoritative files'": "'A separate weekly/manual workflow compares the\\nfive authoritative files'",
           }
           for old, new in replacements.items():
               if text.count(old) != 1:
@@ -76,6 +52,44 @@ if '"strconv"' not in text:
           path.write_text(text)
           PY
           python3 scripts/runtime_notification_remediation.py
+          python3 - <<'PY'
+          from pathlib import Path
+
+          types = Path("internal/api/types.go")
+          text = types.read_text()
+          if '"errors"' not in text:
+              old = '\t"encoding/json"\n'
+              new = '\t"encoding/json"\n\t"errors"\n'
+              if text.count(old) != 1:
+                  raise SystemExit("types.go import insertion point changed")
+              text = text.replace(old, new, 1)
+          types.write_text(text)
+
+          contract = Path("internal/contract/contract.go")
+          text = contract.read_text()
+          old = (
+              '\tdecoder := json.NewDecoder(bytes.NewReader(raw))\n'
+              '\tdecoder.UseNumber()\n'
+              '\tvar value json.Number\n'
+              '\tif err := decoder.Decode(&value); err != nil || value.String() == "" {\n'
+              '\t\treturn fmt.Errorf("%s: expected uint64", path)\n'
+              '\t}\n'
+              '\tif _, err := strconv.ParseUint(value.String(), 10, 64); err != nil {\n'
+              '\t\treturn fmt.Errorf("%s: expected uint64: %w", path, err)\n'
+              '\t}\n'
+              '\treturn nil'
+          )
+          new = (
+              '\tvar value uint64\n'
+              '\tif err := json.Unmarshal(raw, &value); err != nil {\n'
+              '\t\treturn fmt.Errorf("%s: expected uint64: %w", path, err)\n'
+              '\t}\n'
+              '\treturn nil'
+          )
+          if text.count(old) != 1:
+              raise SystemExit(f"uint64 validator replacement count is {text.count(old)}")
+          contract.write_text(text.replace(old, new, 1))
+          PY
           rm scripts/.runtime-notification-remediation.*
           rm scripts/runtime_notification_remediation.py
           rm .github/workflows/runtime-notification-remediation.yml
