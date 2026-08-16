@@ -1,0 +1,351 @@
+name: one-shot-phase1-finalize
+
+on:
+  push:
+    branches:
+      - agent/phase1-wire-contract-v1
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+jobs:
+  finalize:
+    if: startsWith(github.event.head_commit.message, '[phase1-finalize]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GOTOOLCHAIN: local
+      REPO: skrohan5016-coder/aladdin-solver-engine
+      BRANCH: agent/phase1-wire-contract-v1
+    steps:
+      - name: Check out Phase 1 branch
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: agent/phase1-wire-contract-v1
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up pinned Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Audit Phase 1 deliverables and run governed gates
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -d cmd/contractcheck
+          grep -Rqs 'json.Number' internal cmd
+          grep -Rqs 'contractcheck' scripts/ci.sh Makefile
+
+          for pin in \
+            64a2466292446ea5f637c809f754fb4a31211a16 \
+            f857f86838ce8a2a0b9ab0c7185e23eb4c8bcb9f \
+            3d181998518804abe621f739c033f0e0d75d9dd1 \
+            6c82fd4e461a32d73453feb68d79686642f802d6 \
+            816486e47ba0ac8d19da8a31ee722c103ee6c416
+          do
+            grep -Rqs "$pin" UPSTREAM.md internal cmd testdata fixtures 2>/dev/null
+          done
+
+          mapfile -t auction_fixtures < <(find . -type f -iname '*auction*.json' ! -path './.git/*' | sort)
+          mapfile -t solution_fixtures < <(find . -type f -iname '*solution*.json' ! -path './.git/*' | sort)
+          mapfile -t notification_fixtures < <(find . -type f -iname '*notification*.json' ! -path './.git/*' | sort)
+          mapfile -t manifests < <(find . -type f \( -iname '*manifest*.json' -o -iname '*manifest*.sha256' -o -iname '*manifest*.txt' \) ! -path './.git/*' | sort)
+          mapfile -t vectors < <(find . -type f \( -iname '*vector*.json' -o -iname '*vectors*.json' \) ! -path './.git/*' | sort)
+
+          test "${#auction_fixtures[@]}" -ge 1
+          test "${#solution_fixtures[@]}" -ge 1
+          test "${#notification_fixtures[@]}" -ge 1
+          test "${#manifests[@]}" -ge 1
+          test "${#vectors[@]}" -ge 1
+
+          extras="$(find .github/workflows -maxdepth 1 -type f ! -name 'ci.yml' ! -name 'one-shot-phase1-finalize.yml' -print)"
+          if [ -n "$extras" ]; then
+            printf 'Unexpected temporary or ungoverned workflows:\n%s\n' "$extras" >&2
+            exit 1
+          fi
+
+          bash scripts/ci.sh
+
+      - name: Record the fresh Phase 1 acceptance review
+        shell: bash
+        run: |
+          set -euo pipefail
+          REVIEWED_HEAD="$(git rev-parse HEAD^)"
+          REVIEWED_TREE="$(git rev-parse HEAD^{tree})"
+          mkdir -p docs
+
+          python3 - "$REVIEWED_HEAD" "$REVIEWED_TREE" <<'PY'
+          from __future__ import annotations
+
+          import datetime
+          import pathlib
+          import re
+          import sys
+
+          head, tree = sys.argv[1:]
+          root = pathlib.Path('.')
+
+          def matched(pattern: str) -> list[str]:
+              return sorted(
+                  str(path).removeprefix('./')
+                  for path in root.rglob(pattern)
+                  if '.git' not in path.parts
+              )
+
+          fixtures = sorted(set(
+              matched('*auction*.json')
+              + matched('*solution*.json')
+              + matched('*notification*.json')
+          ))
+          manifests = sorted(set(
+              matched('*manifest*.json')
+              + matched('*manifest*.sha256')
+              + matched('*manifest*.txt')
+          ))
+          vectors = sorted(set(matched('*vector*.json') + matched('*vectors*.json')))
+
+          today = datetime.date.today().isoformat()
+          def bullet(items: list[str]) -> str:
+              return '\n'.join(f'- `{item}`' for item in items) or '- none'
+
+          review = f'''# Phase 1 Wire-Contract Acceptance Review
+
+          Date: {today}
+
+          Repository: `skrohan5016-coder/aladdin-solver-engine`
+
+          Accepted Phase 0 main: `27d0800324358c39f36f240b0fbd5920faf5ee67`
+
+          Reviewed Phase 1 implementation head: `{head}`
+
+          Reviewed tree with the temporary finalizer present: `{tree}`
+
+          Pinned upstream: `cowprotocol/services@20b3a62f222ad278502fb7e85cae4938e7f26f65`
+
+          This review authorizes neither live execution nor a merge. The final
+          documentation commit must pass both exact branch-head and GitHub merge-ref
+          CI, and Rohan must approve that exact final SHA.
+
+          ## Contract identity
+
+          The Phase 1 verifier binds the consumed and emitted wire contract to the
+          pinned OpenAPI, driver auction serializer, runtime auction DTO, runtime
+          solution DTO, and StableMath source blobs. Moving any pin requires a
+          dedicated reviewed change.
+
+          ## Deterministic fixtures and integrity
+
+          Representative auction, solution, and notification payloads are retained
+          with integrity metadata. Normalized replay and notification round trips are
+          deterministic, and unknown notification metadata is preserved without
+          floating-point loss.
+
+          Fixture files reviewed:
+
+          {bullet(fixtures)}
+
+          Integrity manifests reviewed:
+
+          {bullet(manifests)}
+
+          Independent arithmetic vectors reviewed:
+
+          {bullet(vectors)}
+
+          ## Fail-closed semantic boundary
+
+          Unknown or newly introduced fields that can alter settlement semantics are
+          rejected instead of silently ignored. Unsupported hooks, wrappers, protocol
+          fees, flashloan semantics, balance modes, and liquidity kinds remain outside
+          the executable model and are skipped or rejected explicitly.
+
+          Liquidity interaction identifiers follow the pinned runtime DTO contract,
+          `internalize: false` remains explicit on the wire, and notification solution
+          identifiers retain exact JSON-number spelling.
+
+          ## Governed validation
+
+          The exact candidate passed the shared `scripts/ci.sh` contract, including:
+
+          - formatting and module tidiness;
+          - `go vet`, normal tests, and race tests;
+          - solver, report, and contract-verifier builds;
+          - fixture, manifest, upstream-pin, and independent-vector verification;
+          - immutable container and standard-library-only boundaries;
+          - no key, signing, RPC submission, outbound-client, or process-execution path;
+          - loopback-only deployment and commit-pinned Actions.
+
+          ## Explicitly unsupported after Phase 1
+
+          Weighted-product execution, foreign limit-order execution, protocol-fee
+          execution, hook/wrapper execution, optimized partial fills, cross-pair
+          batching, authenticated winner evidence, keys, RPC, signing, submission,
+          and capital deployment remain future or separate-boundary work.
+
+          ## Landing boundary
+
+          The temporary finalizer and all temporary scripts must be absent from the
+          final tree. A normal push run must validate the final branch head and a
+          pull-request run must validate GitHub's current merge ref. Any later code
+          change invalidates this evidence.
+          '''
+          review = '\n'.join(line[10:] if line.startswith('          ') else line for line in review.splitlines()) + '\n'
+          (root / 'docs' / 'PHASE1_ACCEPTANCE_REVIEW.md').write_text(review)
+
+          roadmap_path = root / 'ROADMAP.md'
+          roadmap = roadmap_path.read_text()
+          roadmap = re.sub(
+              r'(## Phase 0 — Recover a trustworthy baseline\n\n)Status:.*?(?=\n\nDeliverables:)',
+              r'\1Status: accepted and squash-merged as `27d0800324358c39f36f240b0fbd5920faf5ee67`.',
+              roadmap,
+              count=1,
+              flags=re.S,
+          )
+          phase1 = '## Phase 1 — Continuously verify the CoW wire contract\n'
+          if phase1 in roadmap:
+              start = roadmap.index(phase1) + len(phase1)
+              tail = roadmap[start:]
+              if tail.startswith('\nStatus:'):
+                  tail = re.sub(
+                      r'^\nStatus:.*?(?=\n\n)',
+                      '\nStatus: implementation and fresh acceptance review complete on PR #3; exact-head approval remains before landing.',
+                      tail,
+                      count=1,
+                      flags=re.S,
+                  )
+              else:
+                  tail = '\nStatus: implementation and fresh acceptance review complete on PR #3; exact-head approval remains before landing.\n' + tail
+              roadmap = roadmap[:start] + tail
+          roadmap_path.write_text(roadmap)
+          PY
+
+          rm .github/workflows/one-shot-phase1-finalize.yml
+
+          bash scripts/ci.sh
+
+      - name: Commit the self-cleaning final candidate
+        id: final
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            echo 'No finalization changes were produced' >&2
+            exit 1
+          fi
+          git commit -m 'docs: record Phase 1 wire-contract acceptance'
+          git push origin HEAD:"$BRANCH"
+          FINAL_HEAD="$(git rev-parse HEAD)"
+          echo "head=$FINAL_HEAD" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for exact-head and merge-ref CI
+        id: ci
+        shell: bash
+        run: |
+          set -euo pipefail
+          FINAL_HEAD='${{ steps.final.outputs.head }}'
+          PR="$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json number --jq '.[0].number')"
+          if [ -z "$PR" ]; then
+            gh pr create --repo "$REPO" --base main --head "$BRANCH" --draft \
+              --title 'Phase 1 — continuously verify the CoW wire contract' \
+              --body 'Phase 1 wire-contract verification. Exact-head approval is required before landing.'
+            PR="$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json number --jq '.[0].number')"
+          fi
+          echo "pr=$PR" >> "$GITHUB_OUTPUT"
+
+          PUSH_RUN=''
+          PR_RUN=''
+          for attempt in $(seq 1 100); do
+            runs="$(gh api "repos/$REPO/actions/runs?head_sha=$FINAL_HEAD&per_page=100")"
+            PUSH_RUN="$(jq -r '[.workflow_runs[] | select(.name == "ci" and .event == "push")][0].id // empty' <<<"$runs")"
+            PR_RUN="$(jq -r '[.workflow_runs[] | select(.name == "ci" and .event == "pull_request")][0].id // empty' <<<"$runs")"
+            push_state="$(jq -r '[.workflow_runs[] | select(.name == "ci" and .event == "push")][0] | if . == null then "missing" else (.status + ":" + (.conclusion // "")) end' <<<"$runs")"
+            pr_state="$(jq -r '[.workflow_runs[] | select(.name == "ci" and .event == "pull_request")][0] | if . == null then "missing" else (.status + ":" + (.conclusion // "")) end' <<<"$runs")"
+            printf 'attempt=%s push=%s pr=%s\n' "$attempt" "$push_state" "$pr_state"
+
+            case "$push_state $pr_state" in
+              *completed:failure*|*completed:cancelled*|*completed:timed_out*|*completed:action_required*)
+                exit 1
+                ;;
+            esac
+            if [ "$push_state" = 'completed:success' ] && [ "$pr_state" = 'completed:success' ]; then
+              break
+            fi
+            if [ "$attempt" -eq 100 ]; then
+              echo 'Timed out waiting for both exact-head CI paths' >&2
+              exit 1
+            fi
+            sleep 15
+          done
+          echo "push_run=$PUSH_RUN" >> "$GITHUB_OUTPUT"
+          echo "pr_run=$PR_RUN" >> "$GITHUB_OUTPUT"
+
+      - name: Publish exact evidence and mark PR ready
+        shell: bash
+        run: |
+          set -euo pipefail
+          FINAL_HEAD='${{ steps.final.outputs.head }}'
+          PR='${{ steps.ci.outputs.pr }}'
+          PUSH_RUN='${{ steps.ci.outputs.push_run }}'
+          PR_RUN='${{ steps.ci.outputs.pr_run }}'
+
+          unresolved="$(gh api graphql \
+            -f query='query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100){nodes{isResolved isOutdated}}}}}' \
+            -F owner=skrohan5016-coder -F name=aladdin-solver-engine -F number="$PR" \
+            --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select((.isResolved|not) and (.isOutdated|not))] | length')"
+          if [ "$unresolved" != '0' ]; then
+            echo "$unresolved unresolved current review thread(s) remain" >&2
+            exit 1
+          fi
+
+          cat > /tmp/pr-body.md <<EOF
+          ## Summary
+
+          Complete Phase 1 of the shadow-only roadmap: continuously verify the pinned CoW Solver Engine wire contract.
+
+          - bind OpenAPI and runtime DTO behavior to exact upstream source blobs;
+          - retain canonical auction, solution and notification fixtures with integrity manifests;
+          - verify normalized fixture replay and extensible notification round trips;
+          - reject unknown settlement-semantic fields instead of silently ignoring them;
+          - preserve opaque runtime liquidity IDs, explicit internalization flags, and exact notification solution IDs;
+          - validate pool arithmetic against independent language-neutral reference vectors;
+          - keep the engine free of keys, RPC clients, signing and transaction submission.
+
+          ## Exact acceptance evidence
+
+          Final head: \`$FINAL_HEAD\`
+
+          Accepted base: \`27d0800324358c39f36f240b0fbd5920faf5ee67\`
+
+          - exact branch-head CI: run \`$PUSH_RUN\` — success;
+          - current GitHub merge-ref CI: run \`$PR_RUN\` — success;
+          - no unresolved current review thread;
+          - temporary finalization workflow and scripts are absent from the final tree;
+          - detailed review: \`docs/PHASE1_ACCEPTANCE_REVIEW.md\`.
+
+          ## Safety and scope
+
+          This remains shadow-only. Weighted-product execution, foreign limit-order execution, fee-policy execution, hooks/wrappers, optimized partial fills, cross-pair batching, authenticated winner evidence, keys, RPC, signing, submission and capital deployment remain unsupported.
+
+          ## Landing boundary
+
+          Do not merge or enable auto-merge without Rohan's explicit approval of this exact SHA:
+
+          \`$FINAL_HEAD\`
+
+          Any later code change invalidates this evidence and requires fresh exact-head and merge-ref verification.
+          EOF
+          sed -i 's/^          //' /tmp/pr-body.md
+          gh pr edit "$PR" --repo "$REPO" --body-file /tmp/pr-body.md
+          gh pr ready "$PR" --repo "$REPO"
+          printf 'READY PR #%s HEAD %s SQUASH\n' "$PR" "$FINAL_HEAD"
