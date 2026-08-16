@@ -43,6 +43,8 @@ jobs:
           replacements = {
               'marker = "// ---------- Notification (driver -> solver) ----------\\n"':
                   'marker = "type Notification struct {\\n"',
+              'types.write_text(prefix + marker + block)':
+                  'types.write_text(prefix + block)',
               "'a separate weekly/manual workflow compares the\\nfive authoritative files'":
                   "'A separate weekly/manual workflow compares the\\nfive authoritative files'",
           }
