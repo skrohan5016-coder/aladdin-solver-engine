@@ -1,0 +1,88 @@
+name: phase1-wire-contract-acceptance
+
+on:
+  push:
+    branches:
+      - agent/phase1-wire-contract-v1
+
+permissions:
+  contents: write
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  accept:
+    if: startsWith(github.event.head_commit.message, '[phase1-acceptance]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out Phase 1 branch
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: agent/phase1-wire-contract-v1
+          fetch-depth: 0
+
+      - name: Set up pinned Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Verify final implementation inventory
+        run: |
+          test -f contract/cow-v1/manifest.json
+          test -f contract/cow-v1/auction.json
+          test -f contract/cow-v1/solution.json
+          test -f contract/cow-v1/notification.json
+          test -f contract/cow-v1/reference-vectors.json
+          test -f cmd/contractcheck/main.go
+          test -f internal/server/wire_contract.go
+          test -f scripts/generate_reference_vectors.py
+          test ! -f scripts/phase1_builder.py
+          test ! -f .github/workflows/phase1-wire-contract-builder.yml
+
+      - name: Check out exact upstream source
+        run: |
+          rm -rf /tmp/cow-services
+          git init /tmp/cow-services
+          git -C /tmp/cow-services remote add origin https://github.com/cowprotocol/services.git
+          git -C /tmp/cow-services -c protocol.version=2 fetch --depth=1 origin 20b3a62f222ad278502fb7e85cae4938e7f26f65
+          git -C /tmp/cow-services checkout --detach FETCH_HEAD
+          test "$(git -C /tmp/cow-services rev-parse HEAD)" = "20b3a62f222ad278502fb7e85cae4938e7f26f65"
+
+      - name: Verify source blobs and runtime DTO authority
+        run: |
+          go run ./cmd/contractcheck -root . -upstream-dir /tmp/cow-services
+          grep -Eq 'id:[[:space:]]*String' /tmp/cow-services/crates/solvers-dto/src/solution.rs
+          grep -Eq 'internalize:[[:space:]]*bool' /tmp/cow-services/crates/solvers-dto/src/solution.rs
+          python3 scripts/generate_reference_vectors.py --check
+
+      - name: Run focused compatibility and adversarial tests
+        run: |
+          go test -count=1 ./internal/contract ./internal/api ./internal/amm ./internal/server ./internal/solve
+          go test -race -count=1 ./internal/contract ./internal/api ./internal/amm ./internal/server ./internal/solve
+
+      - name: Run full governed acceptance
+        run: bash scripts/ci.sh
+
+      - name: Write and revalidate acceptance record
+        run: |
+          implementation_head="$(git rev-parse HEAD)"
+          upstream_head="$(git -C /tmp/cow-services rev-parse HEAD)"
+          python3 scripts/phase1_acceptance.py \
+            --implementation-head "$implementation_head" \
+            --upstream-head "$upstream_head"
+          rm scripts/phase1_acceptance.py
+          rm .github/workflows/phase1-acceptance.yml
+          git diff --check
+          bash scripts/ci.sh
+
+      - name: Commit final acceptance record
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git diff --cached --check
+          git commit -m "docs: record Phase 1 wire-contract acceptance"
+          git push origin HEAD:agent/phase1-wire-contract-v1
