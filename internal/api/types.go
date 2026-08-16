@@ -71,26 +71,26 @@ type FeeQuote struct {
 }
 
 type Liquidity struct {
-	Kind        string `json:"kind"`
-	ID          string `json:"id"`
-	Address     string `json:"address"`
-	GasEstimate string `json:"gasEstimate"`
-	Tokens      json.RawMessage `json:"tokens"`
-	Fee         string          `json:"fee"`
-	Router      string          `json:"router,omitempty"`
-	AmplificationParameter string `json:"amplificationParameter,omitempty"`
-	BalancerPoolID         string `json:"balancerPoolId,omitempty"`
-	Version                string `json:"version,omitempty"`
-	SqrtPrice    string            `json:"sqrtPrice,omitempty"`
-	Liquidity    string            `json:"liquidity,omitempty"`
-	Tick         *int32            `json:"tick,omitempty"`
-	LiquidityNet map[string]string `json:"liquidityNet,omitempty"`
-	Hash                string `json:"hash,omitempty"`
-	MakerToken          string `json:"makerToken,omitempty"`
-	TakerToken          string `json:"takerToken,omitempty"`
-	MakerAmount         string `json:"makerAmount,omitempty"`
-	TakerAmount         string `json:"takerAmount,omitempty"`
-	TakerTokenFeeAmount string `json:"takerTokenFeeAmount,omitempty"`
+	Kind                   string            `json:"kind"`
+	ID                     string            `json:"id"`
+	Address                string            `json:"address"`
+	GasEstimate            string            `json:"gasEstimate"`
+	Tokens                 json.RawMessage   `json:"tokens"`
+	Fee                    string            `json:"fee"`
+	Router                 string            `json:"router,omitempty"`
+	AmplificationParameter string            `json:"amplificationParameter,omitempty"`
+	BalancerPoolID         string            `json:"balancerPoolId,omitempty"`
+	Version                string            `json:"version,omitempty"`
+	SqrtPrice              string            `json:"sqrtPrice,omitempty"`
+	Liquidity              string            `json:"liquidity,omitempty"`
+	Tick                   *int32            `json:"tick,omitempty"`
+	LiquidityNet           map[string]string `json:"liquidityNet,omitempty"`
+	Hash                   string            `json:"hash,omitempty"`
+	MakerToken             string            `json:"makerToken,omitempty"`
+	TakerToken             string            `json:"takerToken,omitempty"`
+	MakerAmount            string            `json:"makerAmount,omitempty"`
+	TakerAmount            string            `json:"takerAmount,omitempty"`
+	TakerTokenFeeAmount    string            `json:"takerTokenFeeAmount,omitempty"`
 }
 
 type TokenReserve struct {
