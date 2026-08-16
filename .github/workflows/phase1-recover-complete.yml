@@ -1,0 +1,265 @@
+name: phase1-wire-contract-recover-complete
+
+on:
+  push:
+    branches:
+      - agent/phase1-wire-contract-v1
+
+permissions:
+  actions: read
+  contents: write
+  pull-requests: write
+
+env:
+  GOTOOLCHAIN: local
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  recover:
+    if: startsWith(github.event.head_commit.message, '[phase1-recover-complete]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out current Phase 1 branch
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: agent/phase1-wire-contract-v1
+          fetch-depth: 0
+
+      - name: Set up pinned Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Build or verify Phase 1 implementation
+        run: |
+          if [ -f scripts/phase1_builder.py ]; then
+            python3 scripts/phase1_builder.py
+          fi
+          test -f contract/cow-v1/manifest.json
+          test -f contract/cow-v1/auction.json
+          test -f contract/cow-v1/solution.json
+          test -f contract/cow-v1/notification.json
+          test -f contract/cow-v1/reference-vectors.json
+          test -f cmd/contractcheck/main.go
+          test -f internal/server/wire_contract.go
+          test -f scripts/generate_reference_vectors.py
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          root = Path('.')
+          for path in root.rglob('*.go'):
+              text = path.read_text()
+              updated = re.sub(
+                  r'SolutionID:\s*([0-9]+(?:\.[0-9]+)?)',
+                  lambda match: f'SolutionID: json.Number("{match.group(1)}")',
+                  text,
+              )
+              if updated != text:
+                  if 'json.Number' in updated and '"encoding/json"' not in updated:
+                      if 'import (\n' in updated:
+                          updated = updated.replace('import (\n', 'import (\n\t"encoding/json"\n', 1)
+                      else:
+                          raise SystemExit(f'cannot add encoding/json import to {path}')
+                  path.write_text(updated)
+
+          report = root / 'cmd/report/main.go'
+          text = report.read_text()
+          text = text.replace('Solution  float64 `json:"solutionId"`', 'Solution  json.Number `json:"solutionId"`')
+          report.write_text(text)
+          PY
+
+          rm -f scripts/phase1_builder.py scripts/phase1_acceptance.py
+          rm -f .github/workflows/phase1-wire-contract-builder.yml
+          rm -f .github/workflows/phase1-acceptance.yml
+          rm -f .github/workflows/phase1-finalize.yml
+          rm -f .github/workflows/phase1-recover-complete.yml
+
+          find . -type f -name '*.go' -print0 | xargs -0 gofmt -w
+          ! grep -RInE 'SolutionID:[[:space:]]*[0-9]' --include='*.go' .
+          python3 scripts/generate_reference_vectors.py --check
+          go run ./cmd/contractcheck -root .
+          bash scripts/ci.sh
+          git diff --check
+
+      - name: Check out and verify exact upstream identity
+        run: |
+          rm -rf /tmp/cow-services
+          git init /tmp/cow-services
+          git -C /tmp/cow-services remote add origin https://github.com/cowprotocol/services.git
+          git -C /tmp/cow-services -c protocol.version=2 fetch --depth=1 origin 20b3a62f222ad278502fb7e85cae4938e7f26f65
+          git -C /tmp/cow-services checkout --detach FETCH_HEAD
+          test "$(git -C /tmp/cow-services rev-parse HEAD)" = "20b3a62f222ad278502fb7e85cae4938e7f26f65"
+          go run ./cmd/contractcheck -root . -upstream-dir /tmp/cow-services
+          grep -Eq 'id:[[:space:]]*String' /tmp/cow-services/crates/solvers-dto/src/solution.rs
+          grep -Eq 'internalize:[[:space:]]*bool' /tmp/cow-services/crates/solvers-dto/src/solution.rs
+
+      - name: Run focused fresh review scopes
+        run: |
+          go test -count=1 ./internal/contract ./internal/api ./internal/amm ./internal/server ./internal/solve
+          go test -race -count=1 ./internal/contract ./internal/api ./internal/amm ./internal/server ./internal/solve
+          bash scripts/ci.sh
+
+      - name: Commit reviewed implementation
+        id: implementation
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git diff --cached --check
+          git commit -m "feat: pin and verify CoW wire contract fixtures"
+          implementation_head="$(git rev-parse HEAD)"
+          echo "head=$implementation_head" >> "$GITHUB_OUTPUT"
+
+      - name: Write Phase 1 acceptance record
+        env:
+          IMPLEMENTATION_HEAD: ${{ steps.implementation.outputs.head }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          implementation = os.environ['IMPLEMENTATION_HEAD']
+          content = f'''# Phase 1 Wire-Contract Acceptance Review
+
+Date: 2026-08-16
+
+Repository: `skrohan5016-coder/aladdin-solver-engine`
+
+Accepted Phase 0 landing: `27d0800324358c39f36f240b0fbd5920faf5ee67`
+
+Reviewed Phase 1 implementation head: `{implementation}`
+
+Pinned upstream head independently checked out: `20b3a62f222ad278502fb7e85cae4938e7f26f65`
+
+This review covers the pinned CoW wire contract and deterministic arithmetic
+fixtures only. It does not authorize live solving, signing, transaction
+submission, capital deployment or a merge.
+
+## Upstream identity and runtime authority
+
+A fresh detached checkout of `cowprotocol/services` was verified by recomputing
+Git blob IDs for the pinned OpenAPI, driver serializer, runtime auction DTO,
+runtime solution DTO and StableMath source. The runtime solution DTO was also
+checked directly for opaque string liquidity IDs and the explicit `internalize`
+boolean. End-to-end fixtures enforce that runtime shape rather than the stale
+numeric-ID declaration in the pinned OpenAPI.
+
+## Semantic drift and evidence integrity
+
+Canonical fixtures cover every represented pinned order and liquidity field,
+including known unsupported fee-policy, wrapper, flashloan, weighted-pool and
+foreign-limit-order shapes. Unreviewed auction, token, order, nested policy or
+liquidity fields fail closed. A new liquidity kind also fails closed.
+Notifications remain intentionally extensible: extra metadata is preserved as
+raw JSON and `json.Number` preserves IDs above 2^53. Fixture bytes are bound by
+SHA-256 in `contract/cow-v1/manifest.json`.
+
+Orders carrying flashloan hints are explicitly skipped rather than solved while
+ignoring their execution semantics.
+
+## Independent arithmetic review
+
+A Python standard-library generator independently reconstructs exact integer
+vectors for constant-product quotes, a concentrated-liquidity exact-input step,
+Balancer stable invariant/balance solving and TickMath boundaries. Go tests
+consume the language-neutral vectors and require exact outputs; CI regenerates
+them in `--check` mode.
+
+## Governed validation
+
+The implementation passed canonical fixture and source-pin checks, fresh
+upstream Git-blob verification, focused compatibility/adversarial tests, full
+normal and race suites, formatting, module tidiness, vet, all command builds,
+immutable and network-isolated container checks, the standard-library-only
+boundary, the shadow-only source scan, workflow pinning and loopback-only
+deployment policy.
+
+## Explicitly unsupported
+
+Weighted-product and foreign-limit-order routing, fee-policy execution,
+hook/wrapper/flashloan execution, optimized partial fills, cross-pair batching,
+authenticated winner evidence, keys, RPC access, signing and transaction
+submission remain outside Phase 1.
+
+## Landing boundary
+
+The acceptance-record commit changes documentation only. Its exact final head
+must pass both branch-head and GitHub merge-ref CI. PR #3 remains unmerged until
+Rohan explicitly approves that exact final SHA. Any later code change invalidates
+this review.
+'''
+          path = Path('docs/PHASE1_ACCEPTANCE_REVIEW.md')
+          path.parent.mkdir(parents=True, exist_ok=True)
+          path.write_text(content)
+          PY
+          git add docs/PHASE1_ACCEPTANCE_REVIEW.md
+          git diff --cached --check
+          git commit -m "docs: record Phase 1 wire-contract acceptance"
+          final_head="$(git rev-parse HEAD)"
+          echo "FINAL_HEAD=$final_head" >> "$GITHUB_ENV"
+          bash scripts/ci.sh
+
+      - name: Push atomic implementation and acceptance commits
+        run: git push origin HEAD:agent/phase1-wire-contract-v1
+
+      - name: Wait for exact final CI paths
+        id: ci
+        run: |
+          repository="$GITHUB_REPOSITORY"
+          for attempt in $(seq 1 100); do
+            runs="$(gh api "repos/${repository}/actions/runs?head_sha=${FINAL_HEAD}&per_page=100")"
+            push_run="$(printf '%s' "$runs" | jq -r '[.workflow_runs[] | select(.name == "ci" and .event == "push")][0].id // empty')"
+            push_state="$(printf '%s' "$runs" | jq -r '[.workflow_runs[] | select(.name == "ci" and .event == "push")][0].status // empty')"
+            push_result="$(printf '%s' "$runs" | jq -r '[.workflow_runs[] | select(.name == "ci" and .event == "push")][0].conclusion // empty')"
+            pr_run="$(printf '%s' "$runs" | jq -r '[.workflow_runs[] | select(.name == "ci" and .event == "pull_request")][0].id // empty')"
+            pr_state="$(printf '%s' "$runs" | jq -r '[.workflow_runs[] | select(.name == "ci" and .event == "pull_request")][0].status // empty')"
+            pr_result="$(printf '%s' "$runs" | jq -r '[.workflow_runs[] | select(.name == "ci" and .event == "pull_request")][0].conclusion // empty')"
+            if [ "$push_state" = completed ] && [ "$push_result" != success ]; then
+              echo "exact-head CI failed: $push_run $push_result" >&2
+              exit 1
+            fi
+            if [ "$pr_state" = completed ] && [ "$pr_result" != success ]; then
+              echo "merge-ref CI failed: $pr_run $pr_result" >&2
+              exit 1
+            fi
+            if [ "$push_state" = completed ] && [ "$push_result" = success ] && \
+               [ "$pr_state" = completed ] && [ "$pr_result" = success ]; then
+              echo "push_run=$push_run" >> "$GITHUB_OUTPUT"
+              echo "pr_run=$pr_run" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "timed out waiting for exact final CI" >&2
+          exit 1
+
+      - name: Publish exact evidence and mark PR ready
+        env:
+          PUSH_RUN: ${{ steps.ci.outputs.push_run }}
+          PR_RUN: ${{ steps.ci.outputs.pr_run }}
+        run: |
+          pr_number="$(gh pr list --repo "$GITHUB_REPOSITORY" --head agent/phase1-wire-contract-v1 --state open --json number --jq '.[0].number')"
+          test -n "$pr_number"
+          cat > /tmp/final-evidence.md <<EOF
+Phase 1 is fully verified and remains unmerged.
+
+- exact final head: \`${FINAL_HEAD}\`
+- exact-head CI run: \`${PUSH_RUN}\` — success
+- GitHub merge-ref CI run: \`${PR_RUN}\` — success
+- temporary builder/review workflows and scripts: absent from final tree
+- acceptance record: \`docs/PHASE1_ACCEPTANCE_REVIEW.md\`
+
+Required approval command:
+
+\`CONFIRM MERGE PR #${pr_number} HEAD ${FINAL_HEAD} SQUASH\`
+EOF
+          gh pr comment "$pr_number" --repo "$GITHUB_REPOSITORY" --body-file /tmp/final-evidence.md
+          current_body="$(gh pr view "$pr_number" --repo "$GITHUB_REPOSITORY" --json body --jq .body)"
+          printf '%s\n\n## Exact final acceptance\n\nFinal head: `%s`\n\n- exact-head CI `%s`: success;\n- merge-ref CI `%s`: success;\n- approval command: `CONFIRM MERGE PR #%s HEAD %s SQUASH`.\n' \
+            "$current_body" "$FINAL_HEAD" "$PUSH_RUN" "$PR_RUN" "$pr_number" "$FINAL_HEAD" > /tmp/pr-body.md
+          gh pr edit "$pr_number" --repo "$GITHUB_REPOSITORY" --body-file /tmp/pr-body.md
+          gh pr ready "$pr_number" --repo "$GITHUB_REPOSITORY"
