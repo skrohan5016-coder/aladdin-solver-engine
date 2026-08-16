@@ -18,13 +18,14 @@ type Config struct {
 	// PerTradeGas is the marginal gas cost of including one more trade.
 	PerTradeGas uint64
 	// RequireProfitable drops solutions whose gas cost exceeds the surplus
-	// they generate. Settlement success rate discounts bid quality, so
-	// bidding on batches you would not actually settle is costly.
+	// they generate.
 	RequireProfitable bool
 	// MaxSolutions caps how many solutions are returned per auction.
 	MaxSolutions int
-	// MaxOrders caps how many orders are considered, newest-value first.
+	// MaxOrders caps how many eligible orders are considered.
 	MaxOrders int
+	// MaxPools caps how many supplied liquidity entries are parsed.
+	MaxPools int
 }
 
 func DefaultConfig() Config {
@@ -34,21 +35,24 @@ func DefaultConfig() Config {
 		RequireProfitable:     true,
 		MaxSolutions:          40,
 		MaxOrders:             250,
+		MaxPools:              2_048,
 	}
 }
 
 // Stats reports what the model did with an auction. This is the raw material
-// for answering "how often would we have beaten the winner".
+// for measuring coverage and diagnosing why it was lost.
 type Stats struct {
-	Orders               int            `json:"orders"`
-	PoolsUsable          int            `json:"poolsUsable"`
-	PoolsSkipped         map[string]int `json:"poolsSkipped,omitempty"`
-	CoWMatches           int            `json:"cowMatches"`
-	BaselineRoutes       int            `json:"baselineRoutes"`
-	DroppedNoRoute       int            `json:"droppedNoRoute"`
-	DroppedLimit         int            `json:"droppedLimitPrice"`
-	DroppedNotProfitable int            `json:"droppedNotProfitable"`
-	Solutions            int            `json:"solutions"`
+	Orders                  int            `json:"orders"`
+	PoolsUsable             int            `json:"poolsUsable"`
+	PoolsSkipped            map[string]int `json:"poolsSkipped,omitempty"`
+	CoWMatches              int            `json:"cowMatches"`
+	BaselineRoutes          int            `json:"baselineRoutes"`
+	DroppedUnsupportedOrder int            `json:"droppedUnsupportedOrder"`
+	DroppedNoRoute          int            `json:"droppedNoRoute"`
+	DroppedLimit            int            `json:"droppedLimitPrice"`
+	DroppedNotProfitable    int            `json:"droppedNotProfitable"`
+	CandidateSolutions      int            `json:"candidateSolutions"`
+	Solutions               int            `json:"solutions"`
 }
 
 type Result struct {
@@ -58,17 +62,32 @@ type Result struct {
 
 // Solve produces solutions for an auction. It never signs, submits, or touches
 // funds; it returns proposed settlements only.
-func Solve(ctx context.Context, a *api.Auction, cfg Config) Result {
-	res := Result{}
-	pools, skipped := BuildPools(a.Liquidity)
-	res.Stats.PoolsUsable = len(pools)
-	res.Stats.PoolsSkipped = skipped
+func Solve(ctx context.Context, auction *api.Auction, cfg Config) Result {
+	defaults := DefaultConfig()
+	if cfg.MaxOrders <= 0 {
+		cfg.MaxOrders = defaults.MaxOrders
+	}
+	if cfg.MaxPools <= 0 {
+		cfg.MaxPools = defaults.MaxPools
+	}
+
+	result := Result{}
+	pools, skipped := BuildPoolsContext(ctx, auction.Liquidity, cfg.MaxPools)
+	result.Stats.PoolsUsable = len(pools)
+	result.Stats.PoolsSkipped = skipped
+	if ctx.Err() != nil {
+		return result
+	}
 	graph := NewGraph(pools)
+	if ctx.Err() != nil {
+		return result
+	}
 
-	orders := eligible(a.Orders, cfg.MaxOrders)
-	res.Stats.Orders = len(orders)
+	orders, unsupported := eligible(auction.Orders, cfg.MaxOrders)
+	result.Stats.Orders = len(orders)
+	result.Stats.DroppedUnsupportedOrder = unsupported
 
-	gasPrice, ok := new(big.Int).SetString(a.EffectiveGasPrice, 10)
+	gasPrice, ok := new(big.Int).SetString(auction.EffectiveGasPrice, 10)
 	if !ok || gasPrice.Sign() < 0 {
 		gasPrice = new(big.Int)
 	}
@@ -78,76 +97,103 @@ func Solve(ctx context.Context, a *api.Auction, cfg Config) Result {
 
 	// --- Pass 1: pure CoW matches. No external liquidity, minimal gas. ---
 	matched := map[string]bool{}
-	for _, m := range findCoWMatches(orders) {
-		if err := ctx.Err(); err != nil {
+	for _, match := range findCoWMatchesContext(ctx, orders) {
+		if ctx.Err() != nil {
 			break
 		}
-		sol := m.solution(id, cfg)
-		id++
-		solutions = append(solutions, sol)
-		matched[m.A.UID] = true
-		matched[m.B.UID] = true
-		res.Stats.CoWMatches++
-	}
-
-	// --- Pass 2: baseline routing, one solution per remaining order. ---
-	for i := range orders {
-		if err := ctx.Err(); err != nil {
-			break
-		}
-		o := &orders[i]
-		if matched[o.UID] {
+		gas, ok := sumGas(cfg.SettlementOverheadGas, cfg.PerTradeGas, cfg.PerTradeGas)
+		if !ok {
+			result.Stats.DroppedNotProfitable += 2
 			continue
 		}
-		sol, surplus, surplusToken, gas, why := routeOrder(o, graph, cfg)
+		if cfg.RequireProfitable && !cowProfitable(match, gas, gasPrice, auction.Tokens) {
+			// Stats count orders, not candidate solutions.
+			result.Stats.DroppedNotProfitable += 2
+			continue
+		}
+		solutions = append(solutions, match.solution(id, gas))
+		id++
+		matched[match.A.UID] = true
+		matched[match.B.UID] = true
+		result.Stats.CoWMatches++
+	}
+
+	// --- Pass 2: baseline routing, one candidate per remaining order. ---
+routeLoop:
+	for i := range orders {
+		if ctx.Err() != nil {
+			break
+		}
+		order := &orders[i]
+		if matched[order.UID] {
+			continue
+		}
+		solution, surplus, surplusToken, gas, why := routeOrder(ctx, order, graph, cfg)
 		switch why {
+		case reasonCancelled:
+			break routeLoop
 		case reasonNoRoute:
-			res.Stats.DroppedNoRoute++
+			result.Stats.DroppedNoRoute++
 			continue
 		case reasonLimit:
-			res.Stats.DroppedLimit++
+			result.Stats.DroppedLimit++
 			continue
 		}
-		if cfg.RequireProfitable && !profitable(surplus, surplusToken, gas, gasPrice, a.Tokens) {
-			res.Stats.DroppedNotProfitable++
+		if cfg.RequireProfitable && !profitable(surplus, surplusToken, gas, gasPrice, auction.Tokens) {
+			result.Stats.DroppedNotProfitable++
 			continue
 		}
-		sol.ID = id
+		solution.ID = id
 		id++
-		solutions = append(solutions, sol)
-		res.Stats.BaselineRoutes++
+		solutions = append(solutions, solution)
+		result.Stats.BaselineRoutes++
 	}
 
-	if len(solutions) > cfg.MaxSolutions {
+	result.Stats.CandidateSolutions = len(solutions)
+	if cfg.MaxSolutions <= 0 {
+		solutions = nil
+	} else if len(solutions) > cfg.MaxSolutions {
 		solutions = solutions[:cfg.MaxSolutions]
 	}
-	res.Solutions = solutions
-	res.Stats.Solutions = len(solutions)
-	return res
+	result.Solutions = solutions
+	result.Stats.Solutions = len(solutions)
+	return result
 }
 
-// eligible filters out orders this model cannot honestly settle.
-func eligible(orders []api.Order, max int) []api.Order {
+// eligible filters out orders this model cannot honestly settle. The driver
+// may add new optional fields over time; unsupported execution semantics are
+// skipped rather than silently ignored.
+func eligible(orders []api.Order, max int) ([]api.Order, int) {
 	out := make([]api.Order, 0, len(orders))
-	for _, o := range orders {
-		if len(o.PreInteractions) > 0 || len(o.PostInteractions) > 0 {
-			continue // hooks are not modelled yet
-		}
-		if o.SellTokenSource != "" && o.SellTokenSource != "erc20" {
+	unsupported := 0
+	for _, order := range orders {
+		if len(order.PreInteractions) > 0 || len(order.PostInteractions) > 0 ||
+			len(order.Wrappers) > 0 || len(order.FeePolicies) > 0 {
+			unsupported++
 			continue
 		}
-		if o.BuyTokenDest != "" && o.BuyTokenDest != "erc20" {
+		if order.SellTokenSource != "" && order.SellTokenSource != "erc20" {
+			unsupported++
 			continue
 		}
-		if strings.EqualFold(o.SellToken, o.BuyToken) {
+		if order.BuyTokenDest != "" && order.BuyTokenDest != "erc20" {
+			unsupported++
 			continue
 		}
-		out = append(out, o)
+		if order.Kind != "sell" && order.Kind != "buy" {
+			unsupported++
+			continue
+		}
+		if strings.EqualFold(order.SellToken, order.BuyToken) {
+			unsupported++
+			continue
+		}
+		out = append(out, order)
+		if max > 0 && len(out) >= max {
+			break
+		}
 	}
-	if max > 0 && len(out) > max {
-		out = out[:max]
-	}
-	return out
+	return out, unsupported
 }
 
 type dropReason int
@@ -156,119 +202,161 @@ const (
 	reasonOK dropReason = iota
 	reasonNoRoute
 	reasonLimit
+	reasonCancelled
 )
 
 // routeOrder builds a single-order solution through AMM liquidity.
-func routeOrder(o *api.Order, g *Graph, cfg Config) (api.Solution, *big.Int, string, uint64, dropReason) {
-	sellAmt, ok1 := new(big.Int).SetString(o.SellAmount, 10)
-	buyAmt, ok2 := new(big.Int).SetString(o.BuyAmount, 10)
-	if !ok1 || !ok2 || sellAmt.Sign() <= 0 || buyAmt.Sign() <= 0 {
+func routeOrder(ctx context.Context, order *api.Order, graph *Graph, cfg Config) (api.Solution, *big.Int, string, uint64, dropReason) {
+	sellAmount, ok1 := new(big.Int).SetString(order.SellAmount, 10)
+	buyAmount, ok2 := new(big.Int).SetString(order.BuyAmount, 10)
+	if !ok1 || !ok2 || sellAmount.Sign() <= 0 || buyAmount.Sign() <= 0 {
 		return api.Solution{}, nil, "", 0, reasonNoRoute
 	}
-	sell, buy := strings.ToLower(o.SellToken), strings.ToLower(o.BuyToken)
+	sell, buy := strings.ToLower(order.SellToken), strings.ToLower(order.BuyToken)
 
-	if o.Kind == "buy" {
-		in, route := minInputFor(g, sell, buy, buyAmt, sellAmt)
+	if order.Kind == "buy" {
+		input, route, err := minInputFor(ctx, graph, sell, buy, buyAmount, sellAmount)
+		if err != nil {
+			return api.Solution{}, nil, "", 0, reasonCancelled
+		}
 		if route == nil {
 			return api.Solution{}, nil, "", 0, reasonNoRoute
 		}
-		gas := cfg.SettlementOverheadGas + cfg.PerTradeGas + route.Gas
-		sol := api.Solution{
-			Prices:       map[string]string{sell: buyAmt.String(), buy: in.String()},
-			Trades:       []api.Trade{{Kind: "fulfillment", Order: o.UID, ExecutedAmount: buyAmt.String()}},
+		gas, ok := sumGas(cfg.SettlementOverheadGas, cfg.PerTradeGas, route.Gas)
+		if !ok {
+			return api.Solution{}, nil, "", 0, reasonNoRoute
+		}
+		solution := api.Solution{
+			Prices:       map[string]string{sell: buyAmount.String(), buy: input.String()},
+			Trades:       []api.Trade{{Kind: "fulfillment", Order: order.UID, ExecutedAmount: buyAmount.String()}},
 			Interactions: hopsToInteractions(route),
 			Gas:          gas,
 		}
-		surplus := new(big.Int).Sub(sellAmt, in) // saved sell token
-		return sol, surplus, sell, gas, reasonOK
+		surplus := new(big.Int).Sub(sellAmount, input)
+		return solution, surplus, sell, gas, reasonOK
 	}
 
-	// sell order
-	route := g.BestRoute(sell, buy, sellAmt)
+	route, err := graph.BestRouteContext(ctx, sell, buy, sellAmount)
+	if err != nil {
+		return api.Solution{}, nil, "", 0, reasonCancelled
+	}
 	if route == nil {
 		return api.Solution{}, nil, "", 0, reasonNoRoute
 	}
-	if route.Out.Cmp(buyAmt) < 0 {
+	if route.Out.Cmp(buyAmount) < 0 {
 		return api.Solution{}, nil, "", 0, reasonLimit
 	}
-	gas := cfg.SettlementOverheadGas + cfg.PerTradeGas + route.Gas
-	sol := api.Solution{
-		Prices:       map[string]string{sell: route.Out.String(), buy: sellAmt.String()},
-		Trades:       []api.Trade{{Kind: "fulfillment", Order: o.UID, ExecutedAmount: sellAmt.String()}},
+	gas, ok := sumGas(cfg.SettlementOverheadGas, cfg.PerTradeGas, route.Gas)
+	if !ok {
+		return api.Solution{}, nil, "", 0, reasonNoRoute
+	}
+	solution := api.Solution{
+		Prices:       map[string]string{sell: route.Out.String(), buy: sellAmount.String()},
+		Trades:       []api.Trade{{Kind: "fulfillment", Order: order.UID, ExecutedAmount: sellAmount.String()}},
 		Interactions: hopsToInteractions(route),
 		Gas:          gas,
 	}
-	surplus := new(big.Int).Sub(route.Out, buyAmt)
-	return sol, surplus, buy, gas, reasonOK
+	surplus := new(big.Int).Sub(route.Out, buyAmount)
+	return solution, surplus, buy, gas, reasonOK
 }
 
 // minInputFor binary-searches the smallest input that still buys want.
 // Route output is monotonic in input for every pool kind supported here.
-func minInputFor(g *Graph, sell, buy string, want, maxIn *big.Int) (*big.Int, *Route) {
-	full := g.BestRoute(sell, buy, maxIn)
+func minInputFor(ctx context.Context, graph *Graph, sell, buy string, want, maxIn *big.Int) (*big.Int, *Route, error) {
+	full, err := graph.BestRouteContext(ctx, sell, buy, maxIn)
+	if err != nil {
+		return nil, nil, err
+	}
 	if full == nil || full.Out.Cmp(want) < 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	lo, hi := big.NewInt(1), new(big.Int).Set(maxIn)
 	bestIn, bestRoute := new(big.Int).Set(maxIn), full
-	for i := 0; i < 64 && lo.Cmp(hi) < 0; i++ {
+	for i := 0; i < 256 && lo.Cmp(hi) <= 0; i++ {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
 		mid := new(big.Int).Add(lo, hi)
 		mid.Rsh(mid, 1)
-		if mid.Sign() <= 0 {
-			break
+		route, err := graph.BestRouteContext(ctx, sell, buy, mid)
+		if err != nil {
+			return nil, nil, err
 		}
-		r := g.BestRoute(sell, buy, mid)
-		if r != nil && r.Out.Cmp(want) >= 0 {
-			bestIn, bestRoute = mid, r
+		if route != nil && route.Out.Cmp(want) >= 0 {
+			bestIn, bestRoute = new(big.Int).Set(mid), route
 			hi = new(big.Int).Sub(mid, big.NewInt(1))
 		} else {
 			lo = new(big.Int).Add(mid, big.NewInt(1))
 		}
 	}
-	return bestIn, bestRoute
+	return bestIn, bestRoute, nil
 }
 
-func hopsToInteractions(r *Route) []api.Interaction {
-	out := make([]api.Interaction, 0, len(r.Hops))
-	for _, h := range r.Hops {
+func hopsToInteractions(route *Route) []api.Interaction {
+	out := make([]api.Interaction, 0, len(route.Hops))
+	for _, hop := range route.Hops {
 		out = append(out, api.Interaction{
 			Kind:         "liquidity",
-			ID:           h.Pool.ID,
-			InputToken:   h.TokenIn,
-			OutputToken:  h.TokenOut,
-			InputAmount:  h.AmountIn.String(),
-			OutputAmount: h.Out.String(),
+			ID:           hop.Pool.ID,
+			InputToken:   hop.TokenIn,
+			OutputToken:  hop.TokenOut,
+			InputAmount:  hop.AmountIn.String(),
+			OutputAmount: hop.Out.String(),
 		})
 	}
 	return out
 }
 
-// profitable compares surplus against gas cost, both in native token wei.
-func profitable(surplus *big.Int, token string, gas uint64, gasPrice *big.Int, toks map[string]api.TokenInfo) bool {
+// profitable compares surplus against gas cost, both in native-token wei.
+func profitable(surplus *big.Int, token string, gas uint64, gasPrice *big.Int, tokens map[string]api.TokenInfo) bool {
 	if surplus == nil || surplus.Sign() <= 0 {
 		return false
 	}
-	native := toNative(surplus, token, toks)
+	native := toNative(surplus, token, tokens)
 	if native == nil {
-		return true // no reference price: do not punish the order for it
+		return true // missing reference price: preserve coverage and let the driver score it
 	}
 	cost := new(big.Int).Mul(new(big.Int).SetUint64(gas), gasPrice)
 	return native.Cmp(cost) > 0
 }
 
+func cowProfitable(match Match, gas uint64, gasPrice *big.Int, tokens map[string]api.TokenInfo) bool {
+	surplusA := new(big.Int).Sub(match.SellB, amountOrZero(match.A.BuyAmount))
+	surplusB := new(big.Int).Sub(match.SellA, amountOrZero(match.B.BuyAmount))
+	if surplusA.Sign() < 0 || surplusB.Sign() < 0 {
+		return false
+	}
+	valueA := toNative(surplusA, match.A.BuyToken, tokens)
+	valueB := toNative(surplusB, match.B.BuyToken, tokens)
+	if valueA == nil || valueB == nil {
+		return surplusA.Sign() > 0 || surplusB.Sign() > 0
+	}
+	value := new(big.Int).Add(valueA, valueB)
+	cost := new(big.Int).Mul(new(big.Int).SetUint64(gas), gasPrice)
+	return value.Cmp(cost) > 0
+}
+
+func amountOrZero(value string) *big.Int {
+	amount, ok := new(big.Int).SetString(value, 10)
+	if !ok {
+		return new(big.Int)
+	}
+	return amount
+}
+
 // toNative converts a token amount to native wei using the auction's
 // referencePrice, which is quoted per 10**18 units of the token.
-func toNative(amount *big.Int, token string, toks map[string]api.TokenInfo) *big.Int {
-	for addr, info := range toks {
-		if !strings.EqualFold(addr, token) || info.ReferencePrice == "" {
+func toNative(amount *big.Int, token string, tokens map[string]api.TokenInfo) *big.Int {
+	for address, info := range tokens {
+		if !strings.EqualFold(address, token) || info.ReferencePrice == "" {
 			continue
 		}
-		p, ok := new(big.Int).SetString(info.ReferencePrice, 10)
-		if !ok {
+		price, ok := new(big.Int).SetString(info.ReferencePrice, 10)
+		if !ok || price.Sign() < 0 {
 			return nil
 		}
-		v := new(big.Int).Mul(amount, p)
-		return v.Quo(v, new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil))
+		value := new(big.Int).Mul(amount, price)
+		return value.Quo(value, new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil))
 	}
 	return nil
 }
@@ -281,29 +369,32 @@ type Match struct {
 	SellA, SellB *big.Int
 }
 
-// findCoWMatches pairs opposite sell orders that can be swapped outright.
-//
-// If A sells sA of tokenX wanting at least bA of tokenY, and B sells sB of
-// tokenY wanting at least bB of tokenX, then swapping their full amounts is
-// feasible exactly when sB >= bA and sA >= bB. The clearing price vector
-// {X: sB, Y: sA} balances the settlement by construction.
+// findCoWMatches is the context-free helper retained for focused tests.
 func findCoWMatches(orders []api.Order) []Match {
+	return findCoWMatchesContext(context.Background(), orders)
+}
+
+// findCoWMatchesContext pairs opposite sell orders whose limits cross.
+func findCoWMatchesContext(ctx context.Context, orders []api.Order) []Match {
 	type key struct{ sell, buy string }
 	bucket := map[key][]*api.Order{}
 	for i := range orders {
-		o := &orders[i]
-		if o.Kind != "sell" {
+		if ctx.Err() != nil {
+			return nil
+		}
+		order := &orders[i]
+		if order.Kind != "sell" {
 			continue
 		}
-		bucket[key{strings.ToLower(o.SellToken), strings.ToLower(o.BuyToken)}] = append(
-			bucket[key{strings.ToLower(o.SellToken), strings.ToLower(o.BuyToken)}], o)
+		pair := key{strings.ToLower(order.SellToken), strings.ToLower(order.BuyToken)}
+		bucket[pair] = append(bucket[pair], order)
 	}
 
 	var out []Match
 	used := map[string]bool{}
 	keys := make([]key, 0, len(bucket))
-	for k := range bucket {
-		keys = append(keys, k)
+	for pair := range bucket {
+		keys = append(keys, pair)
 	}
 	sort.Slice(keys, func(i, j int) bool {
 		if keys[i].sell != keys[j].sell {
@@ -312,31 +403,40 @@ func findCoWMatches(orders []api.Order) []Match {
 		return keys[i].buy < keys[j].buy
 	})
 
-	for _, k := range keys {
-		rev := key{k.buy, k.sell}
-		if k.sell > k.buy {
-			continue // handle each unordered pair once
+	for _, pair := range keys {
+		if ctx.Err() != nil {
+			return out
 		}
-		for _, a := range bucket[k] {
+		reverse := key{pair.buy, pair.sell}
+		if pair.sell > pair.buy {
+			continue
+		}
+		for _, a := range bucket[pair] {
+			if ctx.Err() != nil {
+				return out
+			}
 			if used[a.UID] {
 				continue
 			}
-			sA, ok := new(big.Int).SetString(a.SellAmount, 10)
-			bA, ok2 := new(big.Int).SetString(a.BuyAmount, 10)
-			if !ok || !ok2 {
+			sellA, ok1 := new(big.Int).SetString(a.SellAmount, 10)
+			buyA, ok2 := new(big.Int).SetString(a.BuyAmount, 10)
+			if !ok1 || !ok2 || sellA.Sign() <= 0 || buyA.Sign() <= 0 {
 				continue
 			}
-			for _, b := range bucket[rev] {
+			for _, b := range bucket[reverse] {
+				if ctx.Err() != nil {
+					return out
+				}
 				if used[b.UID] {
 					continue
 				}
-				sB, ok := new(big.Int).SetString(b.SellAmount, 10)
-				bB, ok2 := new(big.Int).SetString(b.BuyAmount, 10)
-				if !ok || !ok2 {
+				sellB, ok1 := new(big.Int).SetString(b.SellAmount, 10)
+				buyB, ok2 := new(big.Int).SetString(b.BuyAmount, 10)
+				if !ok1 || !ok2 || sellB.Sign() <= 0 || buyB.Sign() <= 0 {
 					continue
 				}
-				if sB.Cmp(bA) >= 0 && sA.Cmp(bB) >= 0 {
-					out = append(out, Match{A: a, B: b, SellA: sA, SellB: sB})
+				if sellB.Cmp(buyA) >= 0 && sellA.Cmp(buyB) >= 0 {
+					out = append(out, Match{A: a, B: b, SellA: sellA, SellB: sellB})
 					used[a.UID], used[b.UID] = true, true
 					break
 				}
@@ -346,20 +446,20 @@ func findCoWMatches(orders []api.Order) []Match {
 	return out
 }
 
-func (m Match) solution(id uint64, cfg Config) api.Solution {
-	x := strings.ToLower(m.A.SellToken)
-	y := strings.ToLower(m.A.BuyToken)
+func (match Match) solution(id, gas uint64) api.Solution {
+	x := strings.ToLower(match.A.SellToken)
+	y := strings.ToLower(match.A.BuyToken)
 	return api.Solution{
 		ID: id,
 		Prices: map[string]string{
-			x: m.SellB.String(),
-			y: m.SellA.String(),
+			x: match.SellB.String(),
+			y: match.SellA.String(),
 		},
 		Trades: []api.Trade{
-			{Kind: "fulfillment", Order: m.A.UID, ExecutedAmount: m.SellA.String()},
-			{Kind: "fulfillment", Order: m.B.UID, ExecutedAmount: m.SellB.String()},
+			{Kind: "fulfillment", Order: match.A.UID, ExecutedAmount: match.SellA.String()},
+			{Kind: "fulfillment", Order: match.B.UID, ExecutedAmount: match.SellB.String()},
 		},
 		Interactions: []api.Interaction{},
-		Gas:          cfg.SettlementOverheadGas + 2*cfg.PerTradeGas,
+		Gas:          gas,
 	}
 }

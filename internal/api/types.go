@@ -1,5 +1,5 @@
 // Package api contains the wire types for the CoW Protocol solver-engine
-// interface, as defined by cowprotocol/services crates/solvers/openapi.yml.
+// interface, as defined by the pinned cowprotocol/services contract.
 //
 // All token amounts are canonical base-10 uint256 strings. They are never
 // parsed into floats anywhere in this codebase.
@@ -7,6 +7,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"strconv"
 )
 
@@ -51,6 +52,7 @@ type Order struct {
 	Class             string            `json:"class"` // "market" | "limit"
 	AppData           string            `json:"appData"`
 	FlashloanHint     json.RawMessage   `json:"flashloanHint,omitempty"`
+	Wrappers          []json.RawMessage `json:"wrappers,omitempty"`
 	SigningScheme     string            `json:"signingScheme"`
 	Signature         string            `json:"signature"`
 }
@@ -109,9 +111,9 @@ type Trade struct {
 	Fee            string `json:"fee,omitempty"`
 }
 
-// Interaction is a liquidity interaction. The driver expects `id` as a JSON
-// number here even though the auction carries it as a string, so it is
-// re-encoded on the way out.
+// Interaction is a liquidity interaction. The driver currently serializes
+// auction liquidity identifiers as decimal strings but requires the solution
+// identifier as a JSON number.
 type Interaction struct {
 	Kind         string `json:"kind"` // "liquidity"
 	ID           string `json:"-"`
@@ -124,23 +126,76 @@ type Interaction struct {
 
 func (i Interaction) MarshalJSON() ([]byte, error) {
 	type alias Interaction
-	out := struct {
-		ID json.RawMessage `json:"id"`
-		alias
-	}{alias: alias(i)}
-	if n, err := strconv.ParseUint(i.ID, 10, 64); err == nil {
-		out.ID = json.RawMessage(strconv.FormatUint(n, 10))
-	} else {
-		b, _ := json.Marshal(i.ID)
-		out.ID = b
+	n, err := strconv.ParseUint(i.ID, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("liquidity id %q is not a decimal uint64: %w", i.ID, err)
 	}
-	return json.Marshal(out)
+	return json.Marshal(struct {
+		ID uint64 `json:"id"`
+		alias
+	}{ID: n, alias: alias(i)})
 }
 
 // ---------- Notification (driver -> solver) ----------
 
+// Notification keeps all unknown metadata because notification payloads are
+// explicitly extensible and are the evidence needed to explain shadow results.
 type Notification struct {
-	AuctionID  string  `json:"auctionId"`
-	SolutionID float64 `json:"solutionId"`
-	Kind       string  `json:"kind"`
+	AuctionID  string                     `json:"auctionId"`
+	SolutionID float64                    `json:"solutionId"`
+	Kind       string                     `json:"kind"`
+	Extra      map[string]json.RawMessage `json:"-"`
+}
+
+func (n *Notification) UnmarshalJSON(data []byte) error {
+	*n = Notification{}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	if raw, ok := fields["auctionId"]; ok {
+		if err := json.Unmarshal(raw, &n.AuctionID); err != nil {
+			return err
+		}
+		delete(fields, "auctionId")
+	}
+	if raw, ok := fields["solutionId"]; ok {
+		if err := json.Unmarshal(raw, &n.SolutionID); err != nil {
+			return err
+		}
+		delete(fields, "solutionId")
+	}
+	if raw, ok := fields["kind"]; ok {
+		if err := json.Unmarshal(raw, &n.Kind); err != nil {
+			return err
+		}
+		delete(fields, "kind")
+	}
+	n.Extra = fields
+	return nil
+}
+
+func (n Notification) MarshalJSON() ([]byte, error) {
+	fields := make(map[string]json.RawMessage, len(n.Extra)+3)
+	for key, value := range n.Extra {
+		fields[key] = value
+	}
+	put := func(key string, value any) error {
+		raw, err := json.Marshal(value)
+		if err != nil {
+			return err
+		}
+		fields[key] = raw
+		return nil
+	}
+	if err := put("auctionId", n.AuctionID); err != nil {
+		return nil, err
+	}
+	if err := put("solutionId", n.SolutionID); err != nil {
+		return nil, err
+	}
+	if err := put("kind", n.Kind); err != nil {
+		return nil, err
+	}
+	return json.Marshal(fields)
 }

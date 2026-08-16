@@ -1,125 +1,190 @@
 # aladdin-solver-engine
 
-A CoW Protocol solver engine, built to run in **shadow competition** and
-produce the one number that decides whether going live is worth anything:
-how often it can actually solve a real auction.
+A CoW Protocol solver engine for **shadow competition**. It accepts auctions,
+proposes settlement solutions and records driver feedback so the model can be
+improved from evidence rather than guesswork.
 
-It implements the solver-engine interface from
-`cowprotocol/services` (`crates/solvers/openapi.yml`) — `POST /solve` and
-`POST /notify`.
+The service implements the solver-engine surface from the exact upstream source
+snapshot recorded in [UPSTREAM.md](UPSTREAM.md):
 
-## What it will not do
+- `POST /solve`
+- `POST /notify`
+- `GET /health` for local operation
 
-This service **holds no private key, opens no RPC connection, signs nothing,
-and submits nothing on-chain.** It receives an auction over HTTP and returns
-proposed solutions. That is the whole surface.
+See [ROADMAP.md](ROADMAP.md) for the governed development and graduation plan.
 
-All liquidity comes from the auction payload itself — the driver ships pool
-state with every request — so no node, no archive access, no subscription.
+## Hard safety boundary
 
-CI enforces the boundary: any commit introducing a key, a signer, or a
-transaction-submission path fails the build. If a later milestone needs those,
-that is a different repository with a different review standard, not a quiet
-commit here.
+This service:
 
-## The model
+- holds no private key;
+- opens no RPC connection;
+- signs nothing;
+- submits nothing on-chain;
+- reads liquidity only from the auction payload supplied by the driver.
 
-Two passes over each auction.
+CI rejects common key, signing, submission, outbound-client and helper-process
+paths in production Go code. The hardened systemd unit binds to loopback and
+denies non-loopback network traffic. A live solver would require a separate
+repository and security review; it is not a hidden future mode of this process.
 
-**Pass 1 — coincidence of wants.** If order A sells `sA` of token X wanting at
-least `bA` of Y, and order B sells `sB` of Y wanting at least `bB` of X, the
-two can be swapped outright exactly when `sB >= bA` and `sA >= bB`. The
-clearing price vector `{X: sB, Y: sA}` balances the settlement by
-construction. No external liquidity, no AMM hop, minimal gas — which is
-precisely why these solutions score well when they exist.
+## Solving model
 
-**Pass 2 — baseline routing.** Every remaining order is routed through the
-auction's own liquidity: direct pools first, then two-hop paths pivoting
-through whichever tokens the auction's pool graph is most densely connected
-around. No base-token addresses are hardcoded; the pivots are derived per
-auction.
+The engine performs two passes over each auction.
 
-Supported pool kinds: `constantProduct` (Uniswap V2 and forks) and
-`concentratedLiquidity` (Uniswap V3, full tick-crossing swap math). `stable`,
-`weightedProduct`, and `limitOrder` are counted as skipped rather than
-approximated — the report tells you how much liquidity you are leaving on the
-table and therefore what to build next.
+### Pass 1 — coincidence of wants
 
-Buy orders binary-search the minimum input that satisfies the requested output,
-so the user keeps the difference.
+Opposite sell orders are paired when their limits cross. A pure CoW solution
+uses no external liquidity and has the lowest interaction cost. When profitable
+filtering is enabled, the combined native-value surplus must exceed estimated
+gas before the match is returned.
 
-Solutions whose gas cost exceeds the surplus they generate are dropped by
-default (`REQUIRE_PROFITABLE=true`). Bid quality is discounted by settlement
-success rate, so bidding on batches you would not actually settle is not free.
+### Pass 2 — bounded baseline routing
 
-### Arithmetic
+Remaining orders are quoted through liquidity supplied in the auction:
 
-No `float64` ever touches a token amount. Decimal fees from the wire (`"0.003"`)
-are parsed into exact rationals. The V3 tick math is verified against
-Uniswap's own reference values, including `MIN_TICK` and `MAX_TICK`.
+- direct routes;
+- every bounded two-hop pool pair through the most connected auction tokens;
+- deterministic tie-breaking by output, gas and route identity;
+- context cancellation checks between bounded quotes;
+- no hardcoded base-token addresses.
 
-## Known gaps
+Supported pool kinds:
 
-Stated plainly, because a solver that quietly mishandles these loses money
-rather than auctions:
+- `constantProduct` — Uniswap V2-style exact-integer math;
+- `concentratedLiquidity` — Uniswap V3-style tick-crossing math;
+- `stable` — Balancer/Curve-style StableMath, including pools with more than
+  two tokens and token scaling factors.
 
-- Partial fills are not used; matches are full-amount only.
-- Orders carrying pre/post-interaction hooks are skipped.
-- Multi-order batching across different token pairs is not implemented — each
-  solution settles one order, or one CoW pair.
-- Stable and weighted pools are not quoted.
-- No inventory, no JIT liquidity, no CEX-DEX arbitrage.
+Malformed pools are rejected and counted. Supplied liquidity, stable-pool token
+count and V3 tick count are bounded before routing. Unsupported kinds are never
+quoted with an approximation.
 
-## Running it
+Buy orders binary-search the smallest input that satisfies the requested output.
+Sell orders use the highest-output route that respects the order limit.
+
+## Input and arithmetic rules
+
+Token amounts use `math/big`; `float64` never represents a token amount. Decimal
+fees, amplification parameters and scaling factors are parsed as exact
+rationals. Token ordering and equal-connectivity routing ties are deterministic,
+so the same input can be replayed consistently.
+
+`/solve` rejects malformed JSON, multiple top-level values and duplicate object
+keys at any depth. This prevents ambiguous payloads from being interpreted
+differently by this Go service and the upstream Rust driver.
+
+## Unsupported settlement semantics
+
+The current engine safely skips orders carrying behavior it does not yet encode:
+
+- pre- or post-interaction hooks;
+- wrapper calls;
+- protocol fee policies;
+- non-ERC20 sell-token sources or buy-token destinations;
+- unknown order kinds.
+
+Additional current gaps:
+
+- no weighted-product pool quoting;
+- no foreign limit-order liquidity;
+- no optimized partial-fill selection;
+- no multi-order batching across different token pairs;
+- no inventory, JIT liquidity or CEX-DEX arbitrage;
+- no authenticated winner/objective data, so the report does **not** claim a
+  winner-beating rate.
+
+These gaps are measured in recorder output and prioritized according to observed
+shadow coverage.
+
+## Build and validate
+
+Go `1.24.13` is pinned by `go.mod`. GitHub Actions are pinned by immutable commit
+SHA and run on Ubuntu 24.04.
 
 ```sh
-make test          # full suite
-make race          # race detector
-make build         # ./bin/solver and ./bin/report
+make test
+make race
+make build
+make ci
+```
+
+`make ci` is the single source of truth used by GitHub Actions. It runs:
+
+- formatting and module-tidiness validation;
+- exact Go toolchain and upstream-contract pin checks;
+- `go vet`;
+- uncached normal and race-enabled tests;
+- command builds;
+- the standard-library-only dependency boundary;
+- no-key/no-sign/no-submit and no-outbound-client boundaries;
+- workflow-placement and deployment-network checks.
+
+Install the same gates as a pre-push hook with:
+
+```sh
+make hooks
+```
+
+## Run locally
+
+```sh
 make run
 ```
 
-Configuration is environment variables only:
+Configuration is environment-only:
 
 | Variable | Default | Meaning |
-|---|---|---|
-| `LISTEN_ADDR` | `:8000` | Bind address |
-| `RECORD_DIR` | `./data` | Where auction records are written |
-| `RECORD_FULL_AUCTIONS` | `false` | Store full payloads for offline replay (large) |
-| `REQUIRE_PROFITABLE` | `true` | Drop solutions whose gas exceeds their surplus |
-| `SETTLEMENT_OVERHEAD_GAS` | `106000` | Fixed settlement cost |
-| `PER_TRADE_GAS` | `60000` | Marginal cost per trade |
-| `MAX_SOLUTIONS` | `40` | Cap per auction |
-| `MAX_ORDERS` | `250` | Cap per auction |
-| `LOG_LEVEL` | `info` | |
+|---|---:|---|
+| `LISTEN_ADDR` | `127.0.0.1:8000` | Loopback HTTP bind address |
+| `RECORD_DIR` | `./data` | Append-only JSONL evidence directory |
+| `RECORD_FULL_AUCTIONS` | `false` | Retain full auctions for offline replay |
+| `REQUIRE_PROFITABLE` | `true` | Drop candidates whose estimated edge does not cover gas |
+| `SETTLEMENT_OVERHEAD_GAS` | `106000` | Fixed settlement gas estimate |
+| `PER_TRADE_GAS` | `60000` | Marginal gas estimate per trade |
+| `MAX_SOLUTIONS` | `40` | Maximum solutions returned per auction |
+| `MAX_ORDERS` | `250` | Maximum eligible orders considered |
+| `MAX_POOLS` | `2048` | Maximum supplied liquidity entries parsed |
+| `LOG_LEVEL` | `info` | Structured log level |
 
-Deploying on a VPS: `deploy/solver.service` is a hardened systemd unit. Bind to
-`127.0.0.1` and put the driver on the same host; this service has no
-authentication and should not face the internet.
+For a VPS shadow deployment, `deploy/solver.service` provides a hardened systemd
+unit. It permits loopback HTTP to a trusted local driver, denies external network
+egress and restricts filesystem writes to `/opt/solver/data`.
 
-## Reading the results
+## Evidence and reporting
+
+The recorder writes private, daily append-only JSONL files with explicit schema
+identifiers for:
+
+- auctions, solve latency, model stats and proposed solutions;
+- notifications, including unknown extensible metadata sent by the driver.
+
+Recorder open, encode, append, rotation and close failures are surfaced and
+logged rather than silently discarded. Full-auction recording is opt-in because
+it can include order signatures and consumes substantial disk space.
+
+Generate a report with:
 
 ```sh
-./bin/report -dir ./data
+make report
 ```
 
-Reports coverage, solve latency, why orders were dropped, which pool kinds were
-skipped, and what the driver said about each submitted solution.
+The report separates:
 
-**Coverage is the gate.** It is the share of auctions for which the engine
-produced any solution at all. If coverage stays low, the routing model is the
-problem. If coverage is high but the driver reports `simulationFailed` or
-`invalidClearingPrices`, the settlement encoding is. Going live sooner fixes
-neither.
+1. **coverage** — auctions for which any solution was returned;
+2. **validation feedback** — success, simulation, clearing-price, timeout and
+   other driver notification kinds;
+3. **diagnosis** — unsupported orders, unavailable routes, unmet limits,
+   unprofitable candidates and skipped liquidity;
+4. **candidate versus returned solutions** — so the configured cap is explicit.
 
-## Where this sits
+Latency percentiles use nearest-rank calculation and corrupt evidence causes a
+non-zero report failure instead of being skipped.
 
-Shadow competition needs no KYC, no bond, no company, and no capital. Run it
-for several weeks and read the report. Only if coverage and driver feedback
-both look healthy does the question of a live solver become a real question —
-and that question is mostly about capital, latency, and order flow, none of
-which live in this repository.
+Coverage alone is not proof of competitiveness. A winner-beating rate requires
+winner or objective evidence bound to the same auctions; the current report
+states that limitation explicitly.
 
-## Licence
+## License
 
 Unlicensed. All rights reserved.

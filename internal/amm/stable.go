@@ -5,24 +5,8 @@ import (
 	"math/big"
 )
 
-// Balancer StableMath, ported to exact integer arithmetic.
-//
-// This mirrors StableMath.sol as used by Balancer V2 stable pools and the
-// Curve-like pools the CoW driver reports as kind "stable". The reference is
-// cowprotocol/services crates/liquidity-sources/src/balancer_v2/swap/stable_math.rs,
-// which in turn mirrors the deployed contract.
-//
-// Two conventions matter and are easy to get wrong:
-//
-//   - The amplification parameter arrives on the wire as a plain decimal (100),
-//     but the math wants it pre-multiplied by AMP_PRECISION (100000).
-//   - Balances are upscaled to 18 decimals with the pool's scaling factor
-//     before any math, and the output is downscaled afterwards. Scaling factors
-//     and fees are themselves 18-decimal fixed point.
-//
-// Inside the invariant and balance solvers the arithmetic is plain integer
-// mul/div (Solidity's Math.mul / Math.divDown), not fixed point.
-
+// Balancer StableMath, ported to exact integer arithmetic with checked uint256
+// operations matching the pinned upstream implementation.
 var (
 	ampPrecision = big.NewInt(1000)
 	fpOne        = new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)
@@ -35,17 +19,14 @@ const stableMaxIterations = 255
 // quoteStable returns the output amount for selling amountIn of tokenIn.
 func (p *Pool) quoteStable(tokenIn string, amountIn *big.Int) (*big.Int, error) {
 	inIdx, outIdx := -1, -1
-	for i, t := range p.TokenList {
-		if t == tokenIn {
+	for i, token := range p.TokenList {
+		if token == tokenIn {
 			inIdx = i
 		}
 	}
 	if inIdx < 0 {
 		return nil, errors.New("token not in pool")
 	}
-	// A stable pool may hold more than two tokens; the caller resolves which
-	// counterpart it wants via QuoteExactInPair. Default to the single other
-	// token only when the pool really is a pair.
 	if len(p.TokenList) != 2 {
 		return nil, errors.New("stable pool needs an explicit output token")
 	}
@@ -61,61 +42,69 @@ func (p *Pool) quoteStableIndexed(inIdx, outIdx int, amountIn *big.Int) (*big.In
 	if inIdx == outIdx || inIdx < 0 || outIdx < 0 || inIdx >= n || outIdx >= n {
 		return nil, errors.New("bad token index")
 	}
-	if p.AmplificationRaw == nil || p.AmplificationRaw.Sign() <= 0 {
+	if !isU256(amountIn) || amountIn.Sign() <= 0 ||
+		!isU256(p.AmplificationRaw) || p.AmplificationRaw.Sign() <= 0 {
 		return nil, ErrNoLiquidity
 	}
 
-	// Fee is charged on the input, before scaling, rounding the fee up.
-	feeBfp := p.feeBfp()
-	if feeBfp.Cmp(fpOne) >= 0 {
+	feeBfp, err := p.feeBfp()
+	if err != nil || feeBfp.Cmp(fpOne) >= 0 {
 		return nil, errors.New("invalid pool fee")
 	}
-	amountAfterFee := new(big.Int).Sub(amountIn, fpMulUp(amountIn, feeBfp))
-	if amountAfterFee.Sign() <= 0 {
+	fee, err := fpMulUp(amountIn, feeBfp)
+	if err != nil {
+		return nil, err
+	}
+	amountAfterFee, err := subU256(amountIn, fee)
+	if err != nil || amountAfterFee.Sign() <= 0 {
 		return nil, ErrNoLiquidity
 	}
 
-	// Upscale every balance and the input to 18 decimals.
 	balances := make([]*big.Int, n)
 	for i := range balances {
-		if p.Balances[i].Sign() <= 0 {
+		if !isU256(p.Balances[i]) || p.Balances[i].Sign() <= 0 ||
+			!isU256(p.ScalingFactors[i]) || p.ScalingFactors[i].Sign() <= 0 {
 			return nil, ErrNoLiquidity
 		}
-		balances[i] = fpMulDown(p.Balances[i], p.ScalingFactors[i])
-		if balances[i].Sign() <= 0 {
+		balances[i], err = fpMulDown(p.Balances[i], p.ScalingFactors[i])
+		if err != nil || balances[i].Sign() <= 0 {
 			return nil, ErrNoLiquidity
 		}
 	}
-	upIn := fpMulDown(amountAfterFee, p.ScalingFactors[inIdx])
-	if upIn.Sign() <= 0 {
+	upIn, err := fpMulDown(amountAfterFee, p.ScalingFactors[inIdx])
+	if err != nil || upIn.Sign() <= 0 {
 		return nil, ErrNoLiquidity
 	}
 
 	invariant, err := stableInvariant(p.AmplificationRaw, balances)
+	if err != nil || invariant.Sign() <= 0 {
+		return nil, err
+	}
+
+	balances[inIdx], err = addU256(balances[inIdx], upIn)
 	if err != nil {
 		return nil, err
 	}
-	if invariant.Sign() <= 0 {
-		return nil, ErrNoLiquidity
-	}
-
-	balances[inIdx] = new(big.Int).Add(balances[inIdx], upIn)
 	finalOut, err := stableBalanceGivenInvariant(p.AmplificationRaw, balances, invariant, outIdx)
 	if err != nil {
 		return nil, err
 	}
-	balances[inIdx] = new(big.Int).Sub(balances[inIdx], upIn)
+	balances[inIdx], err = subU256(balances[inIdx], upIn)
+	if err != nil {
+		return nil, err
+	}
 
-	upOut := new(big.Int).Sub(balances[outIdx], finalOut)
-	upOut.Sub(upOut, big.NewInt(1)) // the contract keeps one wei
-	if upOut.Sign() <= 0 {
+	upOut, err := subU256(balances[outIdx], finalOut)
+	if err != nil {
+		return nil, err
+	}
+	upOut, err = subU256(upOut, big.NewInt(1))
+	if err != nil || upOut.Sign() <= 0 {
 		return nil, ErrNoLiquidity
 	}
 
-	// Downscale the output, rounding down in the user's disfavour as the
-	// contract does.
-	out := fpDivDown(upOut, p.ScalingFactors[outIdx])
-	if out.Sign() <= 0 || out.Cmp(p.Balances[outIdx]) >= 0 {
+	out, err := fpDivDown(upOut, p.ScalingFactors[outIdx])
+	if err != nil || out.Sign() <= 0 || out.Cmp(p.Balances[outIdx]) >= 0 {
 		return nil, ErrNoLiquidity
 	}
 	return out, nil
@@ -123,47 +112,101 @@ func (p *Pool) quoteStableIndexed(inIdx, outIdx int, amountIn *big.Int) (*big.In
 
 // stableInvariant solves for D by Newton iteration.
 func stableInvariant(ampTimesPrecision *big.Int, balances []*big.Int) (*big.Int, error) {
-	n := int64(len(balances))
-	nBig := big.NewInt(n)
+	if len(balances) == 0 || !isU256(ampTimesPrecision) {
+		return nil, ErrNoLiquidity
+	}
+	nBig := big.NewInt(int64(len(balances)))
 
 	sum := new(big.Int)
-	for _, b := range balances {
-		sum.Add(sum, b)
+	var err error
+	for _, balance := range balances {
+		if !isU256(balance) {
+			return nil, ErrNoLiquidity
+		}
+		sum, err = addU256(sum, balance)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if sum.Sign() == 0 {
 		return new(big.Int), nil
 	}
 
 	invariant := new(big.Int).Set(sum)
-	ampTimesTotal := new(big.Int).Mul(ampTimesPrecision, nBig)
+	ampTimesTotal, err := mulU256(ampTimesPrecision, nBig)
+	if err != nil {
+		return nil, err
+	}
 
 	for i := 0; i < stableMaxIterations; i++ {
 		dP := new(big.Int).Set(invariant)
-		for _, b := range balances {
-			den := new(big.Int).Mul(b, nBig)
-			if den.Sign() == 0 {
+		for _, balance := range balances {
+			product, err := mulU256(dP, invariant)
+			if err != nil {
+				return nil, err
+			}
+			denominator, err := mulU256(balance, nBig)
+			if err != nil || denominator.Sign() == 0 {
 				return nil, ErrNoLiquidity
 			}
-			dP = new(big.Int).Quo(new(big.Int).Mul(dP, invariant), den)
+			dP, err = divDownU256(product, denominator)
+			if err != nil {
+				return nil, err
+			}
 		}
-		prev := new(big.Int).Set(invariant)
+		previous := new(big.Int).Set(invariant)
 
-		// ((ampTimesTotal * sum) / AMP_PRECISION + dP * n) * invariant
-		numerator := new(big.Int).Quo(new(big.Int).Mul(ampTimesTotal, sum), ampPrecision)
-		numerator.Add(numerator, new(big.Int).Mul(dP, nBig))
-		numerator.Mul(numerator, invariant)
+		term, err := mulU256(ampTimesTotal, sum)
+		if err != nil {
+			return nil, err
+		}
+		term, err = divDownU256(term, ampPrecision)
+		if err != nil {
+			return nil, err
+		}
+		dPTimesN, err := mulU256(dP, nBig)
+		if err != nil {
+			return nil, err
+		}
+		numerator, err := addU256(term, dPTimesN)
+		if err != nil {
+			return nil, err
+		}
+		numerator, err = mulU256(numerator, invariant)
+		if err != nil {
+			return nil, err
+		}
 
-		// ((ampTimesTotal - AMP_PRECISION) * invariant) / AMP_PRECISION + (n+1) * dP
-		denominator := new(big.Int).Sub(ampTimesTotal, ampPrecision)
-		denominator.Mul(denominator, invariant)
-		denominator.Quo(denominator, ampPrecision)
-		denominator.Add(denominator, new(big.Int).Mul(big.NewInt(n+1), dP))
-		if denominator.Sign() <= 0 {
+		ampMinusPrecision, err := subU256(ampTimesTotal, ampPrecision)
+		if err != nil {
+			return nil, err
+		}
+		denominator, err := mulU256(ampMinusPrecision, invariant)
+		if err != nil {
+			return nil, err
+		}
+		denominator, err = divDownU256(denominator, ampPrecision)
+		if err != nil {
+			return nil, err
+		}
+		nPlusOne, err := addU256(nBig, big.NewInt(1))
+		if err != nil {
+			return nil, err
+		}
+		lastTerm, err := mulU256(nPlusOne, dP)
+		if err != nil {
+			return nil, err
+		}
+		denominator, err = addU256(denominator, lastTerm)
+		if err != nil || denominator.Sign() <= 0 {
 			return nil, ErrNoLiquidity
 		}
 
-		invariant = new(big.Int).Quo(numerator, denominator)
-		if converged(invariant, prev) {
+		invariant, err = divDownU256(numerator, denominator)
+		if err != nil {
+			return nil, err
+		}
+		if converged(invariant, previous) {
 			return invariant, nil
 		}
 	}
@@ -172,105 +215,177 @@ func stableInvariant(ampTimesPrecision *big.Int, balances []*big.Int) (*big.Int,
 
 // stableBalanceGivenInvariant solves for one token's balance holding D fixed.
 func stableBalanceGivenInvariant(ampTimesPrecision *big.Int, balances []*big.Int, invariant *big.Int, tokenIndex int) (*big.Int, error) {
-	n := int64(len(balances))
-	nBig := big.NewInt(n)
-	ampTimesTotal := new(big.Int).Mul(ampTimesPrecision, nBig)
-
-	sum := new(big.Int).Set(balances[0])
-	pD := new(big.Int).Mul(sum, nBig)
-	for _, b := range balances[1:] {
-		pD = new(big.Int).Mul(pD, b)
-		pD.Mul(pD, nBig)
-		if invariant.Sign() == 0 {
-			return nil, ErrNoLiquidity
-		}
-		pD.Quo(pD, invariant)
-		sum.Add(sum, b)
-	}
-	sum.Sub(sum, balances[tokenIndex])
-
-	inv2 := new(big.Int).Mul(invariant, invariant)
-
-	den := new(big.Int).Mul(ampTimesTotal, pD)
-	if den.Sign() <= 0 {
+	if len(balances) == 0 || tokenIndex < 0 || tokenIndex >= len(balances) ||
+		!isU256(ampTimesPrecision) || !isU256(invariant) {
 		return nil, ErrNoLiquidity
 	}
-	c := divUpInt(inv2, den)
-	c.Mul(c, ampPrecision)
-	c.Mul(c, balances[tokenIndex])
+	nBig := big.NewInt(int64(len(balances)))
+	ampTimesTotal, err := mulU256(ampTimesPrecision, nBig)
+	if err != nil {
+		return nil, err
+	}
 
-	b := new(big.Int).Quo(invariant, ampTimesTotal)
-	b.Mul(b, ampPrecision)
-	b.Add(b, sum)
+	sum := new(big.Int).Set(balances[0])
+	pD, err := mulU256(sum, nBig)
+	if err != nil {
+		return nil, err
+	}
+	for _, balance := range balances[1:] {
+		pD, err = mulU256(pD, balance)
+		if err != nil {
+			return nil, err
+		}
+		pD, err = mulU256(pD, nBig)
+		if err != nil {
+			return nil, err
+		}
+		pD, err = divDownU256(pD, invariant)
+		if err != nil {
+			return nil, err
+		}
+		sum, err = addU256(sum, balance)
+		if err != nil {
+			return nil, err
+		}
+	}
+	sum, err = subU256(sum, balances[tokenIndex])
+	if err != nil {
+		return nil, err
+	}
 
-	tokenBalance := divUpInt(new(big.Int).Add(inv2, c), new(big.Int).Add(invariant, b))
+	inv2, err := mulU256(invariant, invariant)
+	if err != nil {
+		return nil, err
+	}
+	denominator, err := mulU256(ampTimesTotal, pD)
+	if err != nil || denominator.Sign() <= 0 {
+		return nil, ErrNoLiquidity
+	}
+	c, err := divUpU256(inv2, denominator)
+	if err != nil {
+		return nil, err
+	}
+	c, err = mulU256(c, ampPrecision)
+	if err != nil {
+		return nil, err
+	}
+	c, err = mulU256(c, balances[tokenIndex])
+	if err != nil {
+		return nil, err
+	}
+
+	b, err := divDownU256(invariant, ampTimesTotal)
+	if err != nil {
+		return nil, err
+	}
+	b, err = mulU256(b, ampPrecision)
+	if err != nil {
+		return nil, err
+	}
+	b, err = addU256(sum, b)
+	if err != nil {
+		return nil, err
+	}
+
+	top, err := addU256(inv2, c)
+	if err != nil {
+		return nil, err
+	}
+	bottom, err := addU256(invariant, b)
+	if err != nil {
+		return nil, err
+	}
+	tokenBalance, err := divUpU256(top, bottom)
+	if err != nil {
+		return nil, err
+	}
 	for i := 0; i < stableMaxIterations; i++ {
-		prev := new(big.Int).Set(tokenBalance)
-
-		num := new(big.Int).Mul(tokenBalance, tokenBalance)
-		num.Add(num, c)
-
-		d := new(big.Int).Mul(tokenBalance, big.NewInt(2))
-		d.Add(d, b)
-		d.Sub(d, invariant)
-		if d.Sign() <= 0 {
+		previous := new(big.Int).Set(tokenBalance)
+		numerator, err := mulU256(tokenBalance, tokenBalance)
+		if err != nil {
+			return nil, err
+		}
+		numerator, err = addU256(numerator, c)
+		if err != nil {
+			return nil, err
+		}
+		denominator, err := mulU256(tokenBalance, big.NewInt(2))
+		if err != nil {
+			return nil, err
+		}
+		denominator, err = addU256(denominator, b)
+		if err != nil {
+			return nil, err
+		}
+		denominator, err = subU256(denominator, invariant)
+		if err != nil || denominator.Sign() <= 0 {
 			return nil, ErrNoLiquidity
 		}
-
-		tokenBalance = divUpInt(num, d)
-		if converged(tokenBalance, prev) {
+		tokenBalance, err = divUpU256(numerator, denominator)
+		if err != nil {
+			return nil, err
+		}
+		if converged(tokenBalance, previous) {
 			return tokenBalance, nil
 		}
 	}
 	return nil, ErrStableNoConverge
 }
 
-func converged(cur, prev *big.Int) bool {
-	d := new(big.Int).Sub(cur, prev)
-	d.Abs(d)
-	return d.Cmp(big.NewInt(1)) <= 0
+func converged(current, previous *big.Int) bool {
+	difference := new(big.Int).Sub(current, previous)
+	difference.Abs(difference)
+	return difference.Cmp(big.NewInt(1)) <= 0
 }
 
 // ---------- Balancer fixed-point helpers (18 decimals) ----------
 
-func fpMulDown(a, b *big.Int) *big.Int {
-	return new(big.Int).Quo(new(big.Int).Mul(a, b), fpOne)
+func fpMulDown(a, b *big.Int) (*big.Int, error) {
+	product, err := mulU256(a, b)
+	if err != nil {
+		return nil, err
+	}
+	return divDownU256(product, fpOne)
 }
 
-func fpMulUp(a, b *big.Int) *big.Int {
-	prod := new(big.Int).Mul(a, b)
-	if prod.Sign() == 0 {
-		return new(big.Int)
+func fpMulUp(a, b *big.Int) (*big.Int, error) {
+	product, err := mulU256(a, b)
+	if err != nil {
+		return nil, err
 	}
-	// (prod - 1) / ONE + 1
-	r := new(big.Int).Sub(prod, big.NewInt(1))
-	r.Quo(r, fpOne)
-	return r.Add(r, big.NewInt(1))
+	if product.Sign() == 0 {
+		return new(big.Int), nil
+	}
+	product, err = subU256(product, big.NewInt(1))
+	if err != nil {
+		return nil, err
+	}
+	result, err := divDownU256(product, fpOne)
+	if err != nil {
+		return nil, err
+	}
+	return addU256(result, big.NewInt(1))
 }
 
-func fpDivDown(a, scalingFactor *big.Int) *big.Int {
-	if scalingFactor.Sign() <= 0 {
-		return new(big.Int)
+func fpDivDown(a, scalingFactor *big.Int) (*big.Int, error) {
+	if scalingFactor == nil || scalingFactor.Sign() <= 0 {
+		return nil, errors.New("division by zero")
 	}
-	return new(big.Int).Quo(new(big.Int).Mul(a, fpOne), scalingFactor)
-}
-
-func divUpInt(a, b *big.Int) *big.Int {
-	if b.Sign() <= 0 {
-		return new(big.Int)
+	inflated, err := mulU256(a, fpOne)
+	if err != nil {
+		return nil, err
 	}
-	q, r := new(big.Int).QuoRem(a, b, new(big.Int))
-	if r.Sign() != 0 {
-		q.Add(q, big.NewInt(1))
-	}
-	return q
+	return divDownU256(inflated, scalingFactor)
 }
 
 // feeBfp returns the pool fee as an 18-decimal fixed point value.
-func (p *Pool) feeBfp() *big.Int {
-	if p.FeeDen == nil || p.FeeDen.Sign() == 0 {
-		return new(big.Int)
+func (p *Pool) feeBfp() (*big.Int, error) {
+	if !isU256(p.FeeNum) || !isU256(p.FeeDen) || p.FeeDen.Sign() == 0 {
+		return nil, errors.New("invalid pool fee")
 	}
-	v := new(big.Int).Mul(p.FeeNum, fpOne)
-	return v.Quo(v, p.FeeDen)
+	scaled, err := mulU256(p.FeeNum, fpOne)
+	if err != nil {
+		return nil, err
+	}
+	return divDownU256(scaled, p.FeeDen)
 }

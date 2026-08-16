@@ -1,18 +1,21 @@
-// Command solver runs the CoW Protocol solver engine.
+// Command solver runs the CoW Protocol shadow solver engine.
 //
-// It listens for auctions from a CoW driver and returns proposed solutions.
-// It holds no keys, opens no RPC connection, signs nothing, and submits
-// nothing on-chain. All liquidity comes from the auction payload itself.
+// It listens for auctions from a local CoW driver and returns proposed
+// solutions. It holds no keys, opens no RPC connection, signs nothing, and
+// submits nothing on-chain. All liquidity comes from the auction payload.
 package main
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -30,32 +33,45 @@ func main() {
 	cfg.SettlementOverheadGas = envUint("SETTLEMENT_OVERHEAD_GAS", cfg.SettlementOverheadGas)
 	cfg.PerTradeGas = envUint("PER_TRADE_GAS", cfg.PerTradeGas)
 	cfg.RequireProfitable = envBool("REQUIRE_PROFITABLE", cfg.RequireProfitable)
-	cfg.MaxSolutions = int(envUint("MAX_SOLUTIONS", uint64(cfg.MaxSolutions)))
-	cfg.MaxOrders = int(envUint("MAX_ORDERS", uint64(cfg.MaxOrders)))
+	cfg.MaxSolutions = envPositiveInt("MAX_SOLUTIONS", cfg.MaxSolutions)
+	cfg.MaxOrders = envPositiveInt("MAX_ORDERS", cfg.MaxOrders)
+	cfg.MaxPools = envPositiveInt("MAX_POOLS", cfg.MaxPools)
 
-	rec, err := record.New(env("RECORD_DIR", "./data"), envBool("RECORD_FULL_AUCTIONS", false))
+	recorder, err := record.New(env("RECORD_DIR", "./data"), envBool("RECORD_FULL_AUCTIONS", false))
 	if err != nil {
-		log.Error("recorder init failed, continuing without it", "err", err)
-		rec = nil
-	} else {
-		defer rec.Close()
+		log.Error("recorder init failed", "err", err)
+		os.Exit(1)
+	}
+	defer func() {
+		if err := recorder.Close(); err != nil {
+			log.Error("recorder close", "err", err)
+		}
+	}()
+
+	listenAddr := env("LISTEN_ADDR", "127.0.0.1:8000")
+	if err := validateListenAddr(listenAddr); err != nil {
+		log.Error("unsafe listen address", "addr", listenAddr, "err", err)
+		os.Exit(1)
 	}
 
-	srv := &http.Server{
-		Addr:              env("LISTEN_ADDR", ":8000"),
-		Handler:           server.New(cfg, log, rec).Routes(),
+	httpServer := &http.Server{
+		Addr:              listenAddr,
+		Handler:           server.New(cfg, log, recorder).Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       60 * time.Second,
 		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 
 	go func() {
 		log.Info("solver engine listening",
-			"addr", srv.Addr,
+			"addr", httpServer.Addr,
 			"requireProfitable", cfg.RequireProfitable,
+			"maxOrders", cfg.MaxOrders,
+			"maxPools", cfg.MaxPools,
 		)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("listen failed", "err", err)
 			os.Exit(1)
 		}
@@ -68,40 +84,68 @@ func main() {
 	log.Info("shutting down")
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if err := srv.Shutdown(ctx); err != nil {
+	if err := httpServer.Shutdown(ctx); err != nil {
 		log.Error("shutdown", "err", err)
 	}
 }
 
-func env(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
+func env(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
 	}
-	return def
+	return fallback
 }
 
-func envUint(k string, def uint64) uint64 {
-	if v := os.Getenv(k); v != "" {
-		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
-			return n
+func envUint(key string, fallback uint64) uint64 {
+	if value := os.Getenv(key); value != "" {
+		if number, err := strconv.ParseUint(value, 10, 64); err == nil {
+			return number
 		}
 	}
-	return def
+	return fallback
 }
 
-func envBool(k string, def bool) bool {
-	if v := os.Getenv(k); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			return b
+func envPositiveInt(key string, fallback int) int {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	number, err := strconv.ParseUint(value, 10, 64)
+	maxInt := uint64(^uint(0) >> 1)
+	if err != nil || number == 0 || number > maxInt {
+		return fallback
+	}
+	return int(number)
+}
+
+func validateListenAddr(address string) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("parse listen address: %w", err)
+	}
+	if strings.EqualFold(host, "localhost") {
+		return nil
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return fmt.Errorf("host %q is not loopback", host)
+	}
+	return nil
+}
+
+func envBool(key string, fallback bool) bool {
+	if value := os.Getenv(key); value != "" {
+		if parsed, err := strconv.ParseBool(value); err == nil {
+			return parsed
 		}
 	}
-	return def
+	return fallback
 }
 
-func parseLevel(s string) slog.Level {
-	var l slog.Level
-	if err := l.UnmarshalText([]byte(s)); err != nil {
+func parseLevel(value string) slog.Level {
+	var level slog.Level
+	if err := level.UnmarshalText([]byte(value)); err != nil {
 		return slog.LevelInfo
 	}
-	return l
+	return level
 }
