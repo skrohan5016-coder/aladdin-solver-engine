@@ -63,7 +63,44 @@ jobs:
               if text.count(old) != 1:
                   raise SystemExit("types.go import insertion point changed")
               text = text.replace(old, new, 1)
-          types.write_text(text)
+          old = (
+              '\tif trimmed[0] == \'[\' {\n'
+              '\t\tvar values []uint64\n'
+              '\t\tif err := json.Unmarshal(trimmed, &values); err != nil {\n'
+              '\t\t\treturn fmt.Errorf("decode merged notification solution ids: %w", err)\n'
+              '\t\t}\n'
+              '\t\tif values == nil {\n'
+              '\t\t\tvalues = []uint64{}\n'
+              '\t\t}\n'
+              '\t\tid.merged = values\n'
+              '\t\treturn nil\n'
+              '\t}'
+          )
+          new = (
+              '\tif trimmed[0] == \'[\' {\n'
+              '\t\tvar items []json.RawMessage\n'
+              '\t\tif err := json.Unmarshal(trimmed, &items); err != nil {\n'
+              '\t\t\treturn fmt.Errorf("decode merged notification solution ids: %w", err)\n'
+              '\t\t}\n'
+              '\t\tvalues := make([]uint64, len(items))\n'
+              '\t\tfor index, item := range items {\n'
+              '\t\t\tif bytes.Equal(bytes.TrimSpace(item), []byte("null")) {\n'
+              '\t\t\t\treturn fmt.Errorf("decode merged notification solution id %d: null is not uint64", index)\n'
+              '\t\t\t}\n'
+              '\t\t\tif err := json.Unmarshal(item, &values[index]); err != nil {\n'
+              '\t\t\t\treturn fmt.Errorf("decode merged notification solution id %d: %w", index, err)\n'
+              '\t\t\t}\n'
+              '\t\t}\n'
+              '\t\tif items == nil {\n'
+              '\t\t\tvalues = []uint64{}\n'
+              '\t\t}\n'
+              '\t\tid.merged = values\n'
+              '\t\treturn nil\n'
+              '\t}'
+          )
+          if text.count(old) != 1:
+              raise SystemExit(f"merged-id decoder replacement count is {text.count(old)}")
+          types.write_text(text.replace(old, new, 1))
 
           contract = Path("internal/contract/contract.go")
           text = contract.read_text()
@@ -89,6 +126,14 @@ jobs:
           if text.count(old) != 1:
               raise SystemExit(f"uint64 validator replacement count is {text.count(old)}")
           contract.write_text(text.replace(old, new, 1))
+
+          record_test = Path("internal/record/record_test.go")
+          text = record_test.read_text()
+          old = 'auctionID := "auction-42"'
+          new = 'auctionID := "42"'
+          if text.count(old) != 1:
+              raise SystemExit(f"record auction ID replacement count is {text.count(old)}")
+          record_test.write_text(text.replace(old, new, 1))
           PY
           rm scripts/.runtime-notification-remediation.*
           rm scripts/runtime_notification_remediation.py
