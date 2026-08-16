@@ -64,6 +64,12 @@ type Pool struct {
 	Liquidity    *big.Int
 	Tick         int32
 	Ticks        []Tick // sorted ascending by Index
+
+	// stable liquidity. TokenList, Balances and ScalingFactors share indices.
+	TokenList        []string
+	Balances         []*big.Int
+	ScalingFactors   []*big.Int
+	AmplificationRaw *big.Int
 }
 
 type Tick struct {
@@ -71,18 +77,62 @@ type Tick struct {
 	Net   *big.Int
 }
 
-// Tokens returns the pool's token pair.
+// Tokens returns the legacy two-token view of a pool. Multi-token stable pools
+// should use AllTokens instead.
 func (p *Pool) Tokens() (string, string) { return p.TokenA, p.TokenB }
 
-// Other returns the counterpart token, or "" if tok is not in the pool.
-func (p *Pool) Other(tok string) string {
-	switch tok {
-	case p.TokenA:
-		return p.TokenB
-	case p.TokenB:
-		return p.TokenA
+// AllTokens returns every token address in deterministic order.
+func (p *Pool) AllTokens() []string {
+	if len(p.TokenList) > 0 {
+		out := make([]string, len(p.TokenList))
+		for i, token := range p.TokenList {
+			out[i] = strings.ToLower(token)
+		}
+		return out
 	}
-	return ""
+
+	out := make([]string, 0, 2)
+	if p.TokenA != "" {
+		out = append(out, strings.ToLower(p.TokenA))
+	}
+	if p.TokenB != "" && !strings.EqualFold(p.TokenA, p.TokenB) {
+		out = append(out, strings.ToLower(p.TokenB))
+	}
+	return out
+}
+
+// Supports reports whether the pool can quote the requested ordered pair.
+func (p *Pool) Supports(tokenIn, tokenOut string) bool {
+	if strings.EqualFold(tokenIn, tokenOut) {
+		return false
+	}
+	in, out := false, false
+	for _, token := range p.AllTokens() {
+		if strings.EqualFold(token, tokenIn) {
+			in = true
+		}
+		if strings.EqualFold(token, tokenOut) {
+			out = true
+		}
+	}
+	return in && out
+}
+
+// Other returns the counterpart token for a two-token pool, or "" when the
+// token is absent or the pool has more than two tokens.
+func (p *Pool) Other(tok string) string {
+	tokens := p.AllTokens()
+	if len(tokens) != 2 {
+		return ""
+	}
+	switch {
+	case strings.EqualFold(tok, tokens[0]):
+		return tokens[1]
+	case strings.EqualFold(tok, tokens[1]):
+		return tokens[0]
+	default:
+		return ""
+	}
 }
 
 // ParseDecimalRational turns a wire decimal such as "0.003" into an exact
@@ -113,27 +163,59 @@ func ParseDecimalRational(s string) (*big.Int, *big.Int, error) {
 	return num, den, nil
 }
 
-// QuoteExactIn returns the output amount for selling amountIn of tokenIn.
+// QuoteExactIn quotes a two-token pool. Multi-token pools require
+// QuoteExactInPair so the output token is unambiguous.
 func (p *Pool) QuoteExactIn(tokenIn string, amountIn *big.Int) (*big.Int, error) {
+	tokenOut := p.Other(tokenIn)
+	if tokenOut == "" {
+		for _, token := range p.AllTokens() {
+			if strings.EqualFold(token, tokenIn) {
+				return nil, errors.New("multi-token pool needs an explicit output token")
+			}
+		}
+		return nil, errors.New("token not in pool")
+	}
+	return p.QuoteExactInPair(tokenIn, tokenOut, amountIn)
+}
+
+// QuoteExactInPair returns the output amount for a specific ordered token pair.
+func (p *Pool) QuoteExactInPair(tokenIn, tokenOut string, amountIn *big.Int) (*big.Int, error) {
 	if amountIn == nil || amountIn.Sign() <= 0 {
 		return nil, errors.New("amountIn must be positive")
 	}
-	if p.Other(tokenIn) == "" {
-		return nil, errors.New("token not in pool")
+	if !p.Supports(tokenIn, tokenOut) {
+		return nil, errors.New("token pair not in pool")
 	}
+
+	tokenIn = strings.ToLower(tokenIn)
+	tokenOut = strings.ToLower(tokenOut)
 	switch p.Kind {
 	case "constantProduct":
 		return p.quoteConstantProduct(tokenIn, amountIn)
 	case "concentratedLiquidity":
 		return p.quoteConcentrated(tokenIn, amountIn)
+	case "stable":
+		inIdx, outIdx := -1, -1
+		for i, token := range p.TokenList {
+			switch {
+			case strings.EqualFold(token, tokenIn):
+				inIdx = i
+			case strings.EqualFold(token, tokenOut):
+				outIdx = i
+			}
+		}
+		return p.quoteStableIndexed(inIdx, outIdx, amountIn)
 	default:
 		return nil, ErrUnsupportedKind
 	}
 }
 
 func (p *Pool) quoteConstantProduct(tokenIn string, amountIn *big.Int) (*big.Int, error) {
+	if p.ReserveA == nil || p.ReserveB == nil || p.FeeNum == nil || p.FeeDen == nil || p.FeeDen.Sign() <= 0 {
+		return nil, ErrNoLiquidity
+	}
 	rIn, rOut := p.ReserveA, p.ReserveB
-	if tokenIn == p.TokenB {
+	if strings.EqualFold(tokenIn, p.TokenB) {
 		rIn, rOut = p.ReserveB, p.ReserveA
 	}
 	if rIn.Sign() <= 0 || rOut.Sign() <= 0 {
@@ -142,7 +224,7 @@ func (p *Pool) quoteConstantProduct(tokenIn string, amountIn *big.Int) (*big.Int
 	// amountInAfterFee = amountIn * (feeDen - feeNum) / feeDen, kept as a
 	// numerator over feeDen so nothing is rounded before the final division.
 	keep := new(big.Int).Sub(p.FeeDen, p.FeeNum)
-	if keep.Sign() <= 0 {
+	if p.FeeNum.Sign() < 0 || keep.Sign() <= 0 {
 		return nil, errors.New("invalid pool fee")
 	}
 	inAfter := new(big.Int).Mul(amountIn, keep)
@@ -160,6 +242,9 @@ func (p *Pool) quoteConstantProduct(tokenIn string, amountIn *big.Int) (*big.Int
 
 // feePips converts the pool's rational fee to Uniswap-v3 pips (1e6 scale).
 func (p *Pool) feePips() (*big.Int, error) {
+	if p.FeeNum == nil || p.FeeDen == nil || p.FeeDen.Sign() <= 0 || p.FeeNum.Sign() < 0 {
+		return nil, errors.New("invalid concentrated pool fee")
+	}
 	pips := new(big.Int).Mul(p.FeeNum, big.NewInt(1_000_000))
 	pips.Quo(pips, p.FeeDen)
 	if pips.Sign() < 0 || pips.Cmp(big.NewInt(1_000_000)) >= 0 {
