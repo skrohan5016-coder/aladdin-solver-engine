@@ -1,1 +1,1 @@
-# aladdin-solver-engine-
+# aladdin-solver-engine
