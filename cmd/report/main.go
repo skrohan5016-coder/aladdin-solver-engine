@@ -78,10 +78,10 @@ func main() {
 
 	var (
 		withSolution, totalOrders, totalCandidates, totalSolutions int
-		cows, routes                                             int
-		unsupported, noRoute, limit, unprofitable                int
-		latencies                                                []int64
-		skipped                                                  = map[string]int{}
+		cows, routes                                               int
+		unsupported, noRoute, limit, unprofitable                  int
+		latencies                                                  []int64
+		skipped                                                    = map[string]int{}
 	)
 	for _, record := range records {
 		if record.Stats.Solutions > 0 {
