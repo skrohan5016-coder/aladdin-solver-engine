@@ -1,0 +1,36 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - name: format
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - name: vet
+        run: go vet ./...
+      - name: test
+        run: go test -race ./...
+      - name: no third-party dependencies
+        run: |
+          if [ -f go.sum ] && [ -s go.sum ]; then
+            echo "go.sum is non-empty: a third-party dependency was added."
+            echo "This service parses untrusted auction payloads. Keep it stdlib-only."
+            exit 1
+          fi
+      - name: no keys, signing, or submission paths
+        run: |
+          set -e
+          pattern='PrivateKey|privateKey|mnemonic|MNEMONIC|SignTx|SendTransaction|eth_sendRawTransaction'
+          if grep -rInE "$pattern" --include='*.go' . ; then
+            echo "This engine must never sign or submit. Remove the above."
+            exit 1
+          fi
+          echo "shadow boundary intact"
