@@ -40,11 +40,17 @@ jobs:
           from pathlib import Path
           path = Path("scripts/runtime_notification_remediation.py")
           text = path.read_text()
-          old = 'marker = "// ---------- Notification (driver -> solver) ----------\\n"'
-          new = 'marker = "type Notification struct {\\n"'
-          if text.count(old) != 1:
-              raise SystemExit(f"unexpected marker count: {text.count(old)}")
-          path.write_text(text.replace(old, new, 1))
+          replacements = {
+              'marker = "// ---------- Notification (driver -> solver) ----------\\n"':
+                  'marker = "type Notification struct {\\n"',
+              "'a separate weekly/manual workflow compares the\\nfive authoritative files'":
+                  "'A separate weekly/manual workflow compares the\\nfive authoritative files'",
+          }
+          for old, new in replacements.items():
+              if text.count(old) != 1:
+                  raise SystemExit(f"unexpected patcher marker count for {old!r}: {text.count(old)}")
+              text = text.replace(old, new, 1)
+          path.write_text(text)
           PY
           python3 scripts/runtime_notification_remediation.py
           rm scripts/.runtime-notification-remediation.*
