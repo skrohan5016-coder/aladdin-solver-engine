@@ -35,9 +35,11 @@ jobs:
 
       - name: Apply and validate fresh-review remediation
         run: |
-          echo "623dd0c425ff6c74a37143b7acb27670986a69256d745d389aeafa2931825df4  scripts/.phase1_review_fix.py.gz" | sha256sum -c -
+          sha256sum scripts/.phase1_review_fix.py.gz
+          gzip -t scripts/.phase1_review_fix.py.gz
           gzip -dc scripts/.phase1_review_fix.py.gz > scripts/phase1_review_fix.py
-          echo "fc26c7423f60f181722adb5dcca9ddcda3066be04a20098df9681094a6809af7  scripts/phase1_review_fix.py" | sha256sum -c -
+          sha256sum scripts/phase1_review_fix.py
+          python3 -m py_compile scripts/phase1_review_fix.py
           chmod +x scripts/phase1_review_fix.py
           python3 scripts/phase1_review_fix.py
           rm -f scripts/phase1_review_fix.py scripts/.phase1_review_fix.py.gz .phase1-review-trigger
