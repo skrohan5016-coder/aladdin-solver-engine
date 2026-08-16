@@ -17,7 +17,7 @@ func TestNotificationPreservesUnknownMetadata(t *testing.T) {
 	if err := json.Unmarshal(input, &notification); err != nil {
 		t.Fatal(err)
 	}
-	if notification.AuctionID != "42" || notification.SolutionID != 7 || notification.Kind != "success" {
+	if notification.AuctionID != "42" || notification.SolutionID.String() != "7" || notification.Kind != "success" {
 		t.Fatalf("core fields changed: %+v", notification)
 	}
 	if len(notification.Extra) != 2 {
@@ -39,17 +39,40 @@ func TestNotificationPreservesUnknownMetadata(t *testing.T) {
 	}
 }
 
+func TestNotificationPreservesSolutionIDAboveFloatRange(t *testing.T) {
+	const largeID = "9007199254740993"
+	input := []byte(`{"auctionId":"42","solutionId":` + largeID + `,"kind":"success"}`)
+	var notification Notification
+	if err := json.Unmarshal(input, &notification); err != nil {
+		t.Fatal(err)
+	}
+	if notification.SolutionID.String() != largeID {
+		t.Fatalf("solution id changed: got %q want %q", notification.SolutionID, largeID)
+	}
+	encoded, err := json.Marshal(notification)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if string(fields["solutionId"]) != largeID {
+		t.Fatalf("encoded solution id changed: %s", encoded)
+	}
+}
+
 func TestNotificationUnmarshalReplacesPreviousState(t *testing.T) {
 	notification := Notification{
 		AuctionID:  "old",
-		SolutionID: 9,
+		SolutionID: json.Number("9"),
 		Kind:       "old",
 		Extra:      map[string]json.RawMessage{"stale": json.RawMessage(`true`)},
 	}
 	if err := json.Unmarshal([]byte(`{"auctionId":"new","kind":"success"}`), &notification); err != nil {
 		t.Fatal(err)
 	}
-	if notification.AuctionID != "new" || notification.SolutionID != 0 || notification.Kind != "success" {
+	if notification.AuctionID != "new" || notification.SolutionID != "" || notification.Kind != "success" {
 		t.Fatalf("old core state survived unmarshal: %+v", notification)
 	}
 	if _, ok := notification.Extra["stale"]; ok {
