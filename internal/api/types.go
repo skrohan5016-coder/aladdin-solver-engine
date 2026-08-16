@@ -5,7 +5,11 @@
 // parsed into floats anywhere in this codebase.
 package api
 
-import "encoding/json"
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+)
 
 // ---------- Auction (driver -> solver) ----------
 
@@ -37,7 +41,7 @@ type Order struct {
 	FullBuyAmount     string            `json:"fullBuyAmount"`
 	FeePolicies       []FeePolicy       `json:"feePolicies,omitempty"`
 	ValidTo           int64             `json:"validTo"`
-	Kind              string            `json:"kind"` // "sell" | "buy"
+	Kind              string            `json:"kind"`
 	Receiver          string            `json:"receiver,omitempty"`
 	Owner             string            `json:"owner"`
 	PartiallyFillable bool              `json:"partiallyFillable"`
@@ -45,7 +49,7 @@ type Order struct {
 	PostInteractions  []json.RawMessage `json:"postInteractions"`
 	SellTokenSource   string            `json:"sellTokenSource"`
 	BuyTokenDest      string            `json:"buyTokenDestination"`
-	Class             string            `json:"class"` // "market" | "limit"
+	Class             string            `json:"class"`
 	AppData           string            `json:"appData"`
 	FlashloanHint     json.RawMessage   `json:"flashloanHint,omitempty"`
 	Wrappers          []json.RawMessage `json:"wrappers,omitempty"`
@@ -66,31 +70,21 @@ type FeeQuote struct {
 	Fee        string `json:"fee"`
 }
 
-// Liquidity is the flattened union of every pool kind the driver may send.
-// Unknown kinds are preserved but ignored by the router.
 type Liquidity struct {
 	Kind        string `json:"kind"`
 	ID          string `json:"id"`
 	Address     string `json:"address"`
 	GasEstimate string `json:"gasEstimate"`
-
-	// constantProduct / weightedProduct / stable
-	Tokens json.RawMessage `json:"tokens"`
-	Fee    string          `json:"fee"`
-	Router string          `json:"router,omitempty"`
-
-	// Balancer stable / weighted product
+	Tokens      json.RawMessage `json:"tokens"`
+	Fee         string          `json:"fee"`
+	Router      string          `json:"router,omitempty"`
 	AmplificationParameter string `json:"amplificationParameter,omitempty"`
 	BalancerPoolID         string `json:"balancerPoolId,omitempty"`
 	Version                string `json:"version,omitempty"`
-
-	// concentratedLiquidity
 	SqrtPrice    string            `json:"sqrtPrice,omitempty"`
 	Liquidity    string            `json:"liquidity,omitempty"`
 	Tick         *int32            `json:"tick,omitempty"`
 	LiquidityNet map[string]string `json:"liquidityNet,omitempty"`
-
-	// foreign limit order
 	Hash                string `json:"hash,omitempty"`
 	MakerToken          string `json:"makerToken,omitempty"`
 	TakerToken          string `json:"takerToken,omitempty"`
@@ -102,8 +96,6 @@ type Liquidity struct {
 type TokenReserve struct {
 	Balance string `json:"balance"`
 }
-
-// ---------- Solution (solver -> driver) ----------
 
 type SolveResponse struct {
 	Solutions []Solution `json:"solutions"`
@@ -118,16 +110,14 @@ type Solution struct {
 }
 
 type Trade struct {
-	Kind           string `json:"kind"` // "fulfillment"
+	Kind           string `json:"kind"`
 	Order          string `json:"order"`
 	ExecutedAmount string `json:"executedAmount"`
 	Fee            string `json:"fee,omitempty"`
 }
 
-// Interaction mirrors the runtime Rust solution DTO. Liquidity IDs remain
-// opaque strings, and internalize is always emitted explicitly.
 type Interaction struct {
-	Kind         string `json:"kind"` // "liquidity"
+	Kind         string `json:"kind"`
 	ID           string `json:"id"`
 	InputToken   string `json:"inputToken"`
 	OutputToken  string `json:"outputToken"`
@@ -136,12 +126,6 @@ type Interaction struct {
 	Internalize  bool   `json:"internalize"`
 }
 
-// ---------- Notification (driver -> solver) ----------
-
-// Notification keeps all unknown metadata because notification payloads are
-// explicitly extensible and are the evidence needed to explain shadow results.
-// SolutionID is json.Number so IDs above JavaScript's exact-integer range are
-// retained byte-for-byte instead of being rounded through float64.
 type Notification struct {
 	AuctionID  string                     `json:"auctionId"`
 	SolutionID json.Number                `json:"solutionId"`
@@ -155,26 +139,38 @@ func (n *Notification) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &fields); err != nil {
 		return err
 	}
-	if raw, ok := fields["auctionId"]; ok {
-		if err := json.Unmarshal(raw, &n.AuctionID); err != nil {
-			return err
-		}
-		delete(fields, "auctionId")
+	raw, err := takeRequiredNotificationField(fields, "auctionId")
+	if err != nil {
+		return err
 	}
-	if raw, ok := fields["solutionId"]; ok {
-		if err := json.Unmarshal(raw, &n.SolutionID); err != nil {
-			return err
-		}
-		delete(fields, "solutionId")
+	if err := json.Unmarshal(raw, &n.AuctionID); err != nil {
+		return err
 	}
-	if raw, ok := fields["kind"]; ok {
-		if err := json.Unmarshal(raw, &n.Kind); err != nil {
-			return err
-		}
-		delete(fields, "kind")
+	raw, err = takeRequiredNotificationField(fields, "solutionId")
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(raw, &n.SolutionID); err != nil {
+		return err
+	}
+	raw, err = takeRequiredNotificationField(fields, "kind")
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(raw, &n.Kind); err != nil {
+		return err
 	}
 	n.Extra = fields
 	return nil
+}
+
+func takeRequiredNotificationField(fields map[string]json.RawMessage, name string) (json.RawMessage, error) {
+	raw, ok := fields[name]
+	if !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil, fmt.Errorf("notification: missing or null required field %q", name)
+	}
+	delete(fields, name)
+	return raw, nil
 }
 
 func (n Notification) MarshalJSON() ([]byte, error) {
