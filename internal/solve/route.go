@@ -99,6 +99,9 @@ func (g *Graph) BestRouteContext(ctx context.Context, sellToken, buyToken string
 		if err != nil {
 			continue
 		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		best = better(best, &Route{
 			Hops: []Hop{{Pool: pool, TokenIn: sellToken, TokenOut: buyToken, AmountIn: amountIn, Out: out}},
 			Out:  out,
@@ -138,16 +141,26 @@ func (g *Graph) BestRouteContext(ctx context.Context, sellToken, buyToken string
 				if err != nil {
 					continue
 				}
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				gas, ok := sumGas(first.GasEstimate, second.GasEstimate)
+				if !ok {
+					continue
+				}
 				best = better(best, &Route{
 					Hops: []Hop{
 						{Pool: first, TokenIn: sellToken, TokenOut: mid, AmountIn: amountIn, Out: midAmount},
 						{Pool: second, TokenIn: mid, TokenOut: buyToken, AmountIn: midAmount, Out: out},
 					},
 					Out: out,
-					Gas: first.GasEstimate + second.GasEstimate,
+					Gas: gas,
 				})
 			}
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return best, nil
 }
@@ -196,4 +209,15 @@ func routeKey(route *Route) string {
 		builder.WriteByte('\x00')
 	}
 	return builder.String()
+}
+
+func sumGas(values ...uint64) (uint64, bool) {
+	var total uint64
+	for _, value := range values {
+		if value > ^uint64(0)-total {
+			return 0, false
+		}
+		total += value
+	}
+	return total, true
 }

@@ -271,9 +271,9 @@ func (p *Pool) feePips() (*big.Int, error) {
 	if !isU256(p.FeeNum) || !isU256(p.FeeDen) || p.FeeDen.Sign() <= 0 {
 		return nil, errors.New("invalid concentrated pool fee")
 	}
-	pips := new(big.Int).Mul(p.FeeNum, big.NewInt(1_000_000))
-	pips.Quo(pips, p.FeeDen)
-	if !isU256(pips) || pips.Cmp(big.NewInt(1_000_000)) >= 0 {
+	scaled := new(big.Int).Mul(p.FeeNum, big.NewInt(1_000_000))
+	pips, remainder := new(big.Int).QuoRem(scaled, p.FeeDen, new(big.Int))
+	if remainder.Sign() != 0 || !isU256(pips) || pips.Cmp(big.NewInt(1_000_000)) >= 0 {
 		return nil, errors.New("invalid concentrated pool fee")
 	}
 	return pips, nil
@@ -306,6 +306,9 @@ func (p *Pool) quoteConcentrated(tokenIn string, amountIn *big.Int) (*big.Int, e
 	limit := new(big.Int).Sub(maxSqrtRatio, big.NewInt(1))
 	if zeroForOne {
 		limit = new(big.Int).Add(minSqrtRatio, big.NewInt(1))
+	}
+	if (zeroForOne && sqrtPrice.Cmp(limit) <= 0) || (!zeroForOne && sqrtPrice.Cmp(limit) >= 0) {
+		return nil, ErrNoLiquidity
 	}
 
 	idx := sort.Search(len(p.Ticks), func(i int) bool { return p.Ticks[i].Index > p.Tick })
@@ -384,6 +387,9 @@ func (p *Pool) quoteConcentrated(tokenIn string, amountIn *big.Int) (*big.Int, e
 		}
 	}
 
+	if remaining.Sign() != 0 {
+		return nil, errors.New("concentrated quote did not consume the full input")
+	}
 	if amountOut.Sign() <= 0 {
 		return nil, ErrNoLiquidity
 	}

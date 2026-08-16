@@ -63,6 +63,14 @@ type Result struct {
 // Solve produces solutions for an auction. It never signs, submits, or touches
 // funds; it returns proposed settlements only.
 func Solve(ctx context.Context, auction *api.Auction, cfg Config) Result {
+	defaults := DefaultConfig()
+	if cfg.MaxOrders <= 0 {
+		cfg.MaxOrders = defaults.MaxOrders
+	}
+	if cfg.MaxPools <= 0 {
+		cfg.MaxPools = defaults.MaxPools
+	}
+
 	result := Result{}
 	pools, skipped := BuildPoolsContext(ctx, auction.Liquidity, cfg.MaxPools)
 	result.Stats.PoolsUsable = len(pools)
@@ -71,6 +79,9 @@ func Solve(ctx context.Context, auction *api.Auction, cfg Config) Result {
 		return result
 	}
 	graph := NewGraph(pools)
+	if ctx.Err() != nil {
+		return result
+	}
 
 	orders, unsupported := eligible(auction.Orders, cfg.MaxOrders)
 	result.Stats.Orders = len(orders)
@@ -90,13 +101,17 @@ func Solve(ctx context.Context, auction *api.Auction, cfg Config) Result {
 		if ctx.Err() != nil {
 			break
 		}
-		gas := cfg.SettlementOverheadGas + 2*cfg.PerTradeGas
+		gas, ok := sumGas(cfg.SettlementOverheadGas, cfg.PerTradeGas, cfg.PerTradeGas)
+		if !ok {
+			result.Stats.DroppedNotProfitable += 2
+			continue
+		}
 		if cfg.RequireProfitable && !cowProfitable(match, gas, gasPrice, auction.Tokens) {
 			// Stats count orders, not candidate solutions.
 			result.Stats.DroppedNotProfitable += 2
 			continue
 		}
-		solutions = append(solutions, match.solution(id, cfg))
+		solutions = append(solutions, match.solution(id, gas))
 		id++
 		matched[match.A.UID] = true
 		matched[match.B.UID] = true
@@ -207,7 +222,10 @@ func routeOrder(ctx context.Context, order *api.Order, graph *Graph, cfg Config)
 		if route == nil {
 			return api.Solution{}, nil, "", 0, reasonNoRoute
 		}
-		gas := cfg.SettlementOverheadGas + cfg.PerTradeGas + route.Gas
+		gas, ok := sumGas(cfg.SettlementOverheadGas, cfg.PerTradeGas, route.Gas)
+		if !ok {
+			return api.Solution{}, nil, "", 0, reasonNoRoute
+		}
 		solution := api.Solution{
 			Prices:       map[string]string{sell: buyAmount.String(), buy: input.String()},
 			Trades:       []api.Trade{{Kind: "fulfillment", Order: order.UID, ExecutedAmount: buyAmount.String()}},
@@ -228,7 +246,10 @@ func routeOrder(ctx context.Context, order *api.Order, graph *Graph, cfg Config)
 	if route.Out.Cmp(buyAmount) < 0 {
 		return api.Solution{}, nil, "", 0, reasonLimit
 	}
-	gas := cfg.SettlementOverheadGas + cfg.PerTradeGas + route.Gas
+	gas, ok := sumGas(cfg.SettlementOverheadGas, cfg.PerTradeGas, route.Gas)
+	if !ok {
+		return api.Solution{}, nil, "", 0, reasonNoRoute
+	}
 	solution := api.Solution{
 		Prices:       map[string]string{sell: route.Out.String(), buy: sellAmount.String()},
 		Trades:       []api.Trade{{Kind: "fulfillment", Order: order.UID, ExecutedAmount: sellAmount.String()}},
@@ -425,7 +446,7 @@ func findCoWMatchesContext(ctx context.Context, orders []api.Order) []Match {
 	return out
 }
 
-func (match Match) solution(id uint64, cfg Config) api.Solution {
+func (match Match) solution(id, gas uint64) api.Solution {
 	x := strings.ToLower(match.A.SellToken)
 	y := strings.ToLower(match.A.BuyToken)
 	return api.Solution{
@@ -439,6 +460,6 @@ func (match Match) solution(id uint64, cfg Config) api.Solution {
 			{Kind: "fulfillment", Order: match.B.UID, ExecutedAmount: match.SellB.String()},
 		},
 		Interactions: []api.Interaction{},
-		Gas:          cfg.SettlementOverheadGas + 2*cfg.PerTradeGas,
+		Gas:          gas,
 	}
 }

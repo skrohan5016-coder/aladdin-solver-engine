@@ -8,11 +8,14 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -30,24 +33,29 @@ func main() {
 	cfg.SettlementOverheadGas = envUint("SETTLEMENT_OVERHEAD_GAS", cfg.SettlementOverheadGas)
 	cfg.PerTradeGas = envUint("PER_TRADE_GAS", cfg.PerTradeGas)
 	cfg.RequireProfitable = envBool("REQUIRE_PROFITABLE", cfg.RequireProfitable)
-	cfg.MaxSolutions = int(envUint("MAX_SOLUTIONS", uint64(cfg.MaxSolutions)))
-	cfg.MaxOrders = int(envUint("MAX_ORDERS", uint64(cfg.MaxOrders)))
-	cfg.MaxPools = int(envUint("MAX_POOLS", uint64(cfg.MaxPools)))
+	cfg.MaxSolutions = envPositiveInt("MAX_SOLUTIONS", cfg.MaxSolutions)
+	cfg.MaxOrders = envPositiveInt("MAX_ORDERS", cfg.MaxOrders)
+	cfg.MaxPools = envPositiveInt("MAX_POOLS", cfg.MaxPools)
 
 	recorder, err := record.New(env("RECORD_DIR", "./data"), envBool("RECORD_FULL_AUCTIONS", false))
 	if err != nil {
-		log.Error("recorder init failed, continuing without it", "err", err)
-		recorder = nil
-	} else {
-		defer func() {
-			if err := recorder.Close(); err != nil {
-				log.Error("recorder close", "err", err)
-			}
-		}()
+		log.Error("recorder init failed", "err", err)
+		os.Exit(1)
+	}
+	defer func() {
+		if err := recorder.Close(); err != nil {
+			log.Error("recorder close", "err", err)
+		}
+	}()
+
+	listenAddr := env("LISTEN_ADDR", "127.0.0.1:8000")
+	if err := validateListenAddr(listenAddr); err != nil {
+		log.Error("unsafe listen address", "addr", listenAddr, "err", err)
+		os.Exit(1)
 	}
 
 	httpServer := &http.Server{
-		Addr:              env("LISTEN_ADDR", "127.0.0.1:8000"),
+		Addr:              listenAddr,
 		Handler:           server.New(cfg, log, recorder).Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       60 * time.Second,
@@ -95,6 +103,34 @@ func envUint(key string, fallback uint64) uint64 {
 		}
 	}
 	return fallback
+}
+
+func envPositiveInt(key string, fallback int) int {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	number, err := strconv.ParseUint(value, 10, 64)
+	maxInt := uint64(^uint(0) >> 1)
+	if err != nil || number == 0 || number > maxInt {
+		return fallback
+	}
+	return int(number)
+}
+
+func validateListenAddr(address string) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("parse listen address: %w", err)
+	}
+	if strings.EqualFold(host, "localhost") {
+		return nil
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return fmt.Errorf("host %q is not loopback", host)
+	}
+	return nil
 }
 
 func envBool(key string, fallback bool) bool {

@@ -11,6 +11,7 @@ import (
 	"math/big"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/api"
@@ -147,14 +148,21 @@ func validateAuction(auction *api.Auction) error {
 	if !validU256(auction.EffectiveGasPrice, true) {
 		return errors.New("invalid effective gas price")
 	}
+	seenTokenAddresses := map[string]struct{}{}
 	for address, token := range auction.Tokens {
-		if address == "" || !validU256(token.AvailableBalance, true) {
+		normalized := strings.ToLower(address)
+		if normalized == "" || !validU256(token.AvailableBalance, true) {
 			return fmt.Errorf("invalid token %q", address)
 		}
+		if _, duplicate := seenTokenAddresses[normalized]; duplicate {
+			return fmt.Errorf("duplicate token address %q", address)
+		}
+		seenTokenAddresses[normalized] = struct{}{}
 		if token.ReferencePrice != "" && !validU256(token.ReferencePrice, true) {
 			return fmt.Errorf("invalid reference price for token %q", address)
 		}
 	}
+	seenOrderUIDs := map[string]struct{}{}
 	for i, order := range auction.Orders {
 		if order.UID == "" || order.SellToken == "" || order.BuyToken == "" ||
 			!validU256(order.SellAmount, false) || !validU256(order.BuyAmount, false) ||
@@ -164,16 +172,42 @@ func validateAuction(auction *api.Auction) error {
 		if order.FullSellAmount != "" && !validU256(order.FullSellAmount, false) {
 			return fmt.Errorf("invalid full sell amount for order %d", i)
 		}
+		uid := strings.ToLower(order.UID)
+		if _, duplicate := seenOrderUIDs[uid]; duplicate {
+			return fmt.Errorf("duplicate order uid %q", order.UID)
+		}
+		seenOrderUIDs[uid] = struct{}{}
 	}
+	seenLiquidityIDs := map[uint64]struct{}{}
 	for i, liquidity := range auction.Liquidity {
+		if !routableLiquidityKind(liquidity.Kind) {
+			continue
+		}
 		if !decimalDigits(liquidity.ID, 20) {
 			return fmt.Errorf("invalid liquidity id at index %d", i)
 		}
-		if _, err := strconv.ParseUint(liquidity.ID, 10, 64); err != nil {
+		id, err := strconv.ParseUint(liquidity.ID, 10, 64)
+		if err != nil {
 			return fmt.Errorf("invalid liquidity id at index %d: %w", i, err)
 		}
+		if strconv.FormatUint(id, 10) != liquidity.ID {
+			return fmt.Errorf("non-canonical liquidity id at index %d", i)
+		}
+		if _, duplicate := seenLiquidityIDs[id]; duplicate {
+			return fmt.Errorf("duplicate liquidity id %d", id)
+		}
+		seenLiquidityIDs[id] = struct{}{}
 	}
 	return nil
+}
+
+func routableLiquidityKind(kind string) bool {
+	switch kind {
+	case "constantProduct", "concentratedLiquidity", "stable":
+		return true
+	default:
+		return false
+	}
 }
 
 func validU256(raw string, allowZero bool) bool {
