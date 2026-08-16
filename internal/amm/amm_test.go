@@ -60,7 +60,7 @@ func TestConstantProductMatchesUniswapV2(t *testing.T) {
 	}
 }
 
-func TestConstantProductRejectsDust(t *testing.T) {
+func TestConstantProductRejectsDustAndBadFee(t *testing.T) {
 	p := &Pool{
 		Kind: "constantProduct", TokenA: "0xa", TokenB: "0xb",
 		ReserveA: bi("1000000"), ReserveB: bi("1000000"),
@@ -68,6 +68,10 @@ func TestConstantProductRejectsDust(t *testing.T) {
 	}
 	if _, err := p.QuoteExactIn("0xa", big.NewInt(1)); err == nil {
 		t.Error("expected error for an input that rounds to zero output")
+	}
+	p.FeeNum = big.NewInt(-1)
+	if _, err := p.QuoteExactIn("0xa", big.NewInt(100)); err == nil {
+		t.Error("expected a negative fee to be rejected")
 	}
 }
 
@@ -153,8 +157,6 @@ func TestConcentratedQuoteSane(t *testing.T) {
 	if err != nil {
 		t.Fatalf("quote: %v", err)
 	}
-	// At sqrtPrice == 2**96 the pool price is 1:1, so output must be below
-	// the input (fee plus slippage) but within a sane fraction of it.
 	if out.Cmp(in) >= 0 {
 		t.Errorf("output %s should be below input %s at 1:1 price", out, in)
 	}
@@ -178,7 +180,6 @@ func TestConcentratedMonotonicAndSymmetric(t *testing.T) {
 		}
 		prev = out
 	}
-	// Both directions must quote at a 1:1 pool, and closely mirror each other.
 	a, err := concentratedPool().QuoteExactIn("0x0a", bi("1000000000000000000"))
 	if err != nil {
 		t.Fatal(err)
@@ -195,8 +196,66 @@ func TestConcentratedMonotonicAndSymmetric(t *testing.T) {
 	}
 }
 
+func stablePool(tokens ...string) *Pool {
+	balances := make([]*big.Int, len(tokens))
+	scales := make([]*big.Int, len(tokens))
+	for i := range tokens {
+		balances[i] = bi("1000000000000000000000000")
+		scales[i] = bi("1000000000000000000")
+	}
+	return &Pool{
+		Kind:             "stable",
+		TokenA:           tokens[0],
+		TokenB:           tokens[1],
+		TokenList:        tokens,
+		Balances:         balances,
+		ScalingFactors:   scales,
+		AmplificationRaw: big.NewInt(100_000),
+		FeeNum:           big.NewInt(4),
+		FeeDen:           big.NewInt(10_000),
+	}
+}
+
+func TestStableQuoteSaneAndDeterministic(t *testing.T) {
+	p := stablePool("0xa", "0xb")
+	in := bi("1000000000000000000")
+	first, err := p.QuoteExactIn("0xa", in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := p.QuoteExactInPair("0xa", "0xb", in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Cmp(second) != 0 {
+		t.Fatalf("same quote was not deterministic: %s != %s", first, second)
+	}
+	if first.Cmp(in) >= 0 {
+		t.Fatalf("stable quote %s should include fee and be below input %s", first, in)
+	}
+	floor := new(big.Int).Mul(in, big.NewInt(99))
+	floor.Quo(floor, big.NewInt(100))
+	if first.Cmp(floor) <= 0 {
+		t.Fatalf("stable quote %s is implausibly low", first)
+	}
+}
+
+func TestStablePoolSupportsEveryExplicitPair(t *testing.T) {
+	p := stablePool("0xa", "0xb", "0xc")
+	if !p.Supports("0xa", "0xc") || !p.Supports("0xc", "0xb") {
+		t.Fatal("multi-token stable pool did not expose all token pairs")
+	}
+	if _, err := p.QuoteExactIn("0xa", bi("1000000000000000000")); err == nil {
+		t.Fatal("ambiguous multi-token quote should require an output token")
+	}
+	out, err := p.QuoteExactInPair("0xa", "0xc", bi("1000000000000000000"))
+	if err != nil || out.Sign() <= 0 {
+		t.Fatalf("explicit three-token quote failed: out=%v err=%v", out, err)
+	}
+}
+
 func TestUnsupportedKindRejected(t *testing.T) {
-	p := &Pool{Kind: "stable", TokenA: "0xa", TokenB: "0xb", FeeNum: big.NewInt(1), FeeDen: big.NewInt(1000)}
+	p := &Pool{Kind: "weightedProduct", TokenA: "0xa", TokenB: "0xb", FeeNum: big.NewInt(1), FeeDen: big.NewInt(1000)}
 	if _, err := p.QuoteExactIn("0xa", big.NewInt(100)); err != ErrUnsupportedKind {
 		t.Errorf("got %v want ErrUnsupportedKind", err)
 	}
