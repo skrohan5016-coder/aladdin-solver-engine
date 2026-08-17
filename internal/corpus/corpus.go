@@ -31,7 +31,8 @@ const (
 
 	defaultMaxRecordBytes = int64(64 << 20)
 	defaultMaxFileBytes   = int64(64 << 20)
-	defaultMaxCases       = 100_000
+	defaultMaxTotalBytes  = int64(512 << 20)
+	defaultMaxCases       = 10_000
 )
 
 type RedactionPolicy string
@@ -85,6 +86,7 @@ type PackOptions struct {
 	SourceCommit     string
 	RedactionPolicy  RedactionPolicy
 	MaxRecordBytes   int64
+	MaxTotalBytes    int64
 	MaxCases         int
 	RequireToolchain bool
 }
@@ -110,6 +112,9 @@ func Pack(ctx context.Context, recordPaths []string, outputDir string, options P
 	if !buildinfo.ValidCommit(options.SourceCommit) {
 		return Manifest{}, fmt.Errorf("source commit %q is not an exact lowercase 40-hex SHA", options.SourceCommit)
 	}
+	if err := validateRunningSource(options.SourceCommit); err != nil {
+		return Manifest{}, err
+	}
 	if outputDir == "" {
 		return Manifest{}, errors.New("output directory is empty")
 	}
@@ -121,11 +126,13 @@ func Pack(ctx context.Context, recordPaths []string, outputDir string, options P
 
 	var identity *record.ReplayIdentity
 	var cases []preparedCase
+	remainingBytes := options.MaxTotalBytes
 	for _, path := range paths {
-		records, err := readAuctionRecords(path, options.MaxRecordBytes, options.MaxCases-len(cases))
+		records, consumed, err := readAuctionRecords(path, options.MaxRecordBytes, options.MaxCases-len(cases), remainingBytes)
 		if err != nil {
 			return Manifest{}, err
 		}
+		remainingBytes -= consumed
 		for index := range records {
 			if err := ctx.Err(); err != nil {
 				return Manifest{}, err
@@ -199,6 +206,21 @@ func Replay(ctx context.Context, corpusDir string, options ReplayOptions) (Repor
 	if !buildinfo.ValidCommit(options.SourceCommit) {
 		return Report{}, fmt.Errorf("source commit %q is not an exact lowercase 40-hex SHA", options.SourceCommit)
 	}
+	if err := validateRunningSource(options.SourceCommit); err != nil {
+		return Report{}, err
+	}
+	root, err := openPrivateDirectory(corpusDir)
+	if err != nil {
+		return Report{}, fmt.Errorf("open corpus directory: %w", err)
+	}
+	defer root.Close()
+	rootInfo, err := root.Stat()
+	if err != nil {
+		return Report{}, err
+	}
+	if runtime.GOOS != "windows" && rootInfo.Mode().Perm()&0o077 != 0 {
+		return Report{}, fmt.Errorf("corpus directory permissions %04o are not private", rootInfo.Mode().Perm())
+	}
 	manifestPath := filepath.Join(corpusDir, "manifest.json")
 	manifestBytes, err := readRegularBounded(manifestPath, options.MaxFileBytes)
 	if err != nil {
@@ -211,7 +233,10 @@ func Replay(ctx context.Context, corpusDir string, options ReplayOptions) (Repor
 	if err := validateManifest(manifest, options); err != nil {
 		return Report{}, err
 	}
-	if err := validateInventory(corpusDir, manifest); err != nil {
+	if err := validateInventory(root, manifest); err != nil {
+		return Report{}, err
+	}
+	if err := ensureDirectoryIdentity(corpusDir, rootInfo); err != nil {
 		return Report{}, err
 	}
 	config, err := manifest.Config.Config()
@@ -268,6 +293,10 @@ func Replay(ctx context.Context, corpusDir string, options ReplayOptions) (Repor
 		resultHash.Write(actualBytes)
 	}
 
+	if err := ensureDirectoryIdentity(corpusDir, rootInfo); err != nil {
+		return Report{}, err
+	}
+
 	return Report{
 		Schema:            ReportSchema,
 		CorpusSHA256:      digest(manifestBytes),
@@ -295,6 +324,9 @@ func resolvePackOptions(options PackOptions) PackOptions {
 	if options.MaxRecordBytes <= 0 {
 		options.MaxRecordBytes = defaultMaxRecordBytes
 	}
+	if options.MaxTotalBytes <= 0 {
+		options.MaxTotalBytes = defaultMaxTotalBytes
+	}
 	if options.MaxCases <= 0 {
 		options.MaxCases = defaultMaxCases
 	}
@@ -320,15 +352,25 @@ func resolveReplayOptions(options ReplayOptions) ReplayOptions {
 	return options
 }
 
-func readAuctionRecords(path string, maxLineBytes int64, remaining int) ([]record.AuctionRecord, error) {
+func readAuctionRecords(path string, maxLineBytes int64, remaining int, remainingBytes int64) ([]record.AuctionRecord, int64, error) {
 	if remaining <= 0 {
-		return nil, errors.New("corpus case limit reached before reading all records")
+		return nil, 0, errors.New("corpus case limit reached before reading all records")
+	}
+	if remainingBytes <= 0 {
+		return nil, 0, errors.New("corpus input byte limit reached before reading all records")
 	}
 	file, err := openRegular(path)
 	if err != nil {
-		return nil, fmt.Errorf("open auction records %s: %w", path, err)
+		return nil, 0, fmt.Errorf("open auction records %s: %w", path, err)
 	}
 	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, 0, err
+	}
+	if info.Size() <= 0 || info.Size() > remainingBytes {
+		return nil, 0, fmt.Errorf("%s: input size %d is outside 1..%d remaining corpus bytes", path, info.Size(), remainingBytes)
+	}
 	reader := bufio.NewReaderSize(file, 64<<10)
 	var records []record.AuctionRecord
 	for lineNumber := 1; ; lineNumber++ {
@@ -337,24 +379,24 @@ func readAuctionRecords(path string, maxLineBytes int64, remaining int) ([]recor
 			break
 		}
 		if err != nil {
-			return nil, fmt.Errorf("%s:%d: %w", path, lineNumber, err)
+			return nil, 0, fmt.Errorf("%s:%d: %w", path, lineNumber, err)
 		}
 		if len(bytes.TrimSpace(line)) == 0 {
-			return nil, fmt.Errorf("%s:%d: blank record line", path, lineNumber)
+			return nil, 0, fmt.Errorf("%s:%d: blank record line", path, lineNumber)
 		}
 		var item record.AuctionRecord
 		if err := decodeStrict(bytes.TrimSuffix(line, []byte{'\n'}), &item); err != nil {
-			return nil, fmt.Errorf("%s:%d: decode record: %w", path, lineNumber, err)
+			return nil, 0, fmt.Errorf("%s:%d: decode record: %w", path, lineNumber, err)
 		}
 		if item.Schema != record.AuctionRecordSchema {
-			return nil, fmt.Errorf("%s:%d: unsupported auction record schema %q", path, lineNumber, item.Schema)
+			return nil, 0, fmt.Errorf("%s:%d: unsupported auction record schema %q", path, lineNumber, item.Schema)
 		}
 		records = append(records, item)
 		if len(records) > remaining {
-			return nil, fmt.Errorf("%s: record count exceeds remaining case limit %d", path, remaining)
+			return nil, 0, fmt.Errorf("%s: record count exceeds remaining case limit %d", path, remaining)
 		}
 	}
-	return records, nil
+	return records, info.Size(), nil
 }
 
 func readCompleteLine(reader *bufio.Reader, maxBytes int64) ([]byte, error) {
@@ -383,6 +425,13 @@ func readCompleteLine(reader *bufio.Reader, maxBytes int64) ([]byte, error) {
 func prepareRecord(ctx context.Context, item record.AuctionRecord, policy RedactionPolicy) (preparedCase, error) {
 	if _, err := time.Parse(time.RFC3339Nano, item.Timestamp); err != nil {
 		return preparedCase{}, fmt.Errorf("invalid record timestamp: %w", err)
+	}
+	embeddedID := ""
+	if item.Auction.ID != nil {
+		embeddedID = *item.Auction.ID
+	}
+	if item.AuctionID != embeddedID {
+		return preparedCase{}, fmt.Errorf("record auction id %q does not match embedded auction id %q", item.AuctionID, embeddedID)
 	}
 	config, err := item.Identity.Config.Config()
 	if err != nil {
@@ -468,6 +517,14 @@ func publish(outputDir string, manifest *Manifest, cases []preparedCase) error {
 	if err := os.MkdirAll(parent, 0o750); err != nil {
 		return err
 	}
+	if err := rejectSymlinkParents(outputDir); err != nil {
+		return err
+	}
+	parentHandle, err := openPrivateDirectory(parent)
+	if err != nil {
+		return fmt.Errorf("open corpus parent: %w", err)
+	}
+	_ = parentHandle.Close()
 	lockPath := outputDir + ".lock"
 	lock, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
@@ -610,8 +667,20 @@ func validateIdentity(identity record.ReplayIdentity, sourceCommit string, requi
 	if digestValue != identity.ConfigSHA256 {
 		return errors.New("recorded config digest mismatch")
 	}
-	if requireToolchain && identity.Engine.GoVersion != runtime.Version() {
-		return fmt.Errorf("Go toolchain mismatch: recorded %s current %s", identity.Engine.GoVersion, runtime.Version())
+	if requireToolchain {
+		if identity.Engine.GoVersion != runtime.Version() {
+			return fmt.Errorf("Go toolchain mismatch: recorded %s current %s", identity.Engine.GoVersion, runtime.Version())
+		}
+		if identity.Engine.GOOS != runtime.GOOS || identity.Engine.GOARCH != runtime.GOARCH {
+			return fmt.Errorf("platform mismatch: recorded %s/%s current %s/%s", identity.Engine.GOOS, identity.Engine.GOARCH, runtime.GOOS, runtime.GOARCH)
+		}
+	}
+	return nil
+}
+
+func validateRunningSource(sourceCommit string) error {
+	if buildinfo.ValidCommit(buildinfo.Commit) && buildinfo.Commit != sourceCommit {
+		return fmt.Errorf("running binary source mismatch: embedded %s requested %s", buildinfo.Commit, sourceCommit)
 	}
 	return nil
 }
@@ -674,7 +743,12 @@ func openRegular(path string) (*os.File, error) {
 		_ = file.Close()
 		return nil, err
 	}
-	if !os.SameFile(before, after) || !after.Mode().IsRegular() {
+	pathAfter, err := os.Lstat(path)
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	if pathAfter.Mode()&os.ModeSymlink != 0 || !os.SameFile(before, after) || !os.SameFile(after, pathAfter) || !after.Mode().IsRegular() {
 		_ = file.Close()
 		return nil, fmt.Errorf("file changed during open: %s", path)
 	}
@@ -721,8 +795,8 @@ func readEntry(dir, name string, expectedBytes int64, expectedDigest string, max
 	return data, nil
 }
 
-func validateInventory(dir string, manifest Manifest) error {
-	entries, err := os.ReadDir(dir)
+func validateInventory(directory *os.File, manifest Manifest) error {
+	entries, err := directory.ReadDir(-1)
 	if err != nil {
 		return err
 	}
@@ -739,6 +813,9 @@ func validateInventory(dir string, manifest Manifest) error {
 		}
 		if entry.Type()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 			return fmt.Errorf("corpus inventory contains non-regular entry %q", entry.Name())
+		}
+		if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+			return fmt.Errorf("corpus file %q permissions %04o are not private", entry.Name(), info.Mode().Perm())
 		}
 		actual[entry.Name()] = struct{}{}
 	}
@@ -764,13 +841,73 @@ func writeExclusive(path string, data []byte) error {
 		return err
 	}
 	writeErr := func() error {
-		if _, err := file.Write(data); err != nil {
+		if err := writeAll(file, data); err != nil {
 			return err
 		}
 		return file.Sync()
 	}()
 	closeErr := file.Close()
 	return errors.Join(writeErr, closeErr)
+}
+
+func writeAll(writer io.Writer, data []byte) error {
+	for len(data) > 0 {
+		written, err := writer.Write(data)
+		if written < 0 || written > len(data) {
+			return errors.New("writer returned an invalid byte count")
+		}
+		data = data[written:]
+		if err != nil {
+			return err
+		}
+		if written == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
+}
+
+func openPrivateDirectory(path string) (*os.File, error) {
+	before, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if before.Mode()&os.ModeSymlink != 0 || !before.IsDir() {
+		return nil, fmt.Errorf("not a real directory: %s", path)
+	}
+	if runtime.GOOS != "windows" && before.Mode().Perm()&0o022 != 0 {
+		return nil, fmt.Errorf("directory permissions %04o permit group or world writes: %s", before.Mode().Perm(), path)
+	}
+	directory, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	after, err := directory.Stat()
+	if err != nil {
+		_ = directory.Close()
+		return nil, err
+	}
+	pathAfter, err := os.Lstat(path)
+	if err != nil {
+		_ = directory.Close()
+		return nil, err
+	}
+	if pathAfter.Mode()&os.ModeSymlink != 0 || !os.SameFile(before, after) || !os.SameFile(after, pathAfter) || !after.IsDir() {
+		_ = directory.Close()
+		return nil, fmt.Errorf("directory changed during open: %s", path)
+	}
+	return directory, nil
+}
+
+func ensureDirectoryIdentity(path string, expected os.FileInfo) error {
+	current, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if current.Mode()&os.ModeSymlink != 0 || !current.IsDir() || !os.SameFile(expected, current) {
+		return fmt.Errorf("corpus directory changed during replay: %s", path)
+	}
+	return nil
 }
 
 func syncDirectory(path string) error {

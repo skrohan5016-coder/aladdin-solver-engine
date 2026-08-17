@@ -8,10 +8,10 @@ config.local.*
 
 # Build output
 /bin/
-solver
-report
-replay
-contractcheck
+/solver
+/report
+/replay
+/contractcheck
 
 # Private sealed replay corpora
 /corpora/

@@ -39,15 +39,15 @@ bin/replay pack \
 Publication is fail-closed:
 
 - every JSONL record must end in a newline;
-- every record line is size-bounded and strictly decoded;
+- every record line, total input byte volume, and case count are bounded and strictly decoded;
 - all records must share one source, toolchain, upstream, and config identity;
 - recorded solutions and statistics must reproduce before publication;
 - the destination must not already exist;
 - files are written into a private temporary directory with exclusive creation;
 - `manifest.json` is written last and the completed directory is atomically
   renamed into place;
-- symlinked parents, symlinked inputs, duplicate inventory, partial records, and
-  corruption are rejected.
+- symlinked parents, symlinked inputs or corpus roots, duplicate inventory,
+  partial records, broad corpus-file permissions, and corruption are rejected.
 
 ## Redaction and retention
 
@@ -73,7 +73,7 @@ bin/replay verify \
 ```
 
 The verifier checks the exact inventory, byte lengths, SHA-256 values, schemas,
-source commit, pinned upstream commit, Go version, and config digest. It then
+source commit, pinned upstream commit, Go version, operating system, architecture, and config digest. It then
 replays every auction and compares canonical expected solutions and statistics.
 The emitted replay report contains deterministic corpus and result digests; two
 runs over the same accepted corpus produce identical report bytes.

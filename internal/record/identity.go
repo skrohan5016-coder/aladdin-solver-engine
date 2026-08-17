@@ -41,6 +41,9 @@ func NewWithOptions(dir string, options Options) (*Recorder, error) {
 	if options.EngineCommit != "" {
 		engine.Commit = options.EngineCommit
 	}
+	if options.KeepAuctions && !buildinfo.ValidCommit(engine.Commit) {
+		return nil, fmt.Errorf("full-auction recording requires an exact engine commit, got %q", engine.Commit)
+	}
 	return &Recorder{
 		dir:          dir,
 		KeepAuctions: options.KeepAuctions,
