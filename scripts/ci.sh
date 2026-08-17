@@ -52,6 +52,15 @@ else
   fail "go.mod must pin go 1.24.13"
 fi
 
+section "Pinned wire contract"
+run_gate "fixture byte digests" python3 scripts/check_contract_fixtures.py
+run_gate "upstream pin consistency" python3 scripts/check_upstream_pin.py
+run_gate "independent arithmetic vectors" python3 scripts/generate_reference_vectors.py --check
+run_gate "contract fixtures and replay" go run ./cmd/contractcheck -dir testdata/contracts
+run_gate "pin-change governance" python3 scripts/check_pin_change.py
+run_gate "workflow action pins" python3 scripts/check_workflow_pins.py
+run_gate "Python helper syntax" python3 -m py_compile scripts/check_contract_fixtures.py scripts/check_pin_change.py scripts/check_upstream_drift.py scripts/check_upstream_pin.py scripts/check_workflow_pins.py scripts/generate_reference_vectors.py
+
 section "Static analysis"
 run_gate "go vet" go vet ./...
 
@@ -60,7 +69,7 @@ run_gate "go test" go test -count=1 ./...
 run_gate "go test -race" go test -race -count=1 ./...
 
 section "Build"
-run_gate "solver and report build" go build -trimpath ./cmd/solver ./cmd/report
+run_gate "solver, report and contractcheck build" go build -trimpath ./cmd/solver ./cmd/report ./cmd/contractcheck
 if grep -q '^FROM golang:1.24.13-alpine3.22@sha256:3641e0d9b931dc4f2f185dcd669c4679670e9277c8166a838ddb98a2d4389cb5 AS build$' Dockerfile &&
   grep -q '^FROM scratch$' Dockerfile; then
   pass "container bases are immutable"
@@ -108,6 +117,13 @@ else
   printf '%s\n' "$misplaced"
   fail "workflow is missing or misplaced"
 fi
+unexpected_workflows="$(find .github/workflows -maxdepth 1 -type f ! -name 'ci.yml' ! -name 'upstream-contract-drift.yml' -print | sort)"
+if [ -z "$unexpected_workflows" ]; then
+  pass "only governed permanent workflows are present"
+else
+  printf '%s\n' "$unexpected_workflows"
+  fail "temporary or ungoverned workflow remains"
+fi
 if grep -q 'actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09' .github/workflows/ci.yml &&
   grep -q 'actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16' .github/workflows/ci.yml; then
   pass "GitHub Actions are pinned by commit"
@@ -118,6 +134,30 @@ if grep -q '20b3a62f222ad278502fb7e85cae4938e7f26f65' UPSTREAM.md; then
   pass "upstream solver contract is pinned"
 else
   fail "missing upstream solver-contract pin"
+fi
+
+section "Repository cleanliness"
+temporary_paths=(
+  ".phase1-review-trigger"
+  ".github/workflows/one-shot-phase1-finalize.yml"
+  "scripts/.phase1_review_fix.py.gz"
+  "scripts/phase1_acceptance.py"
+  "scripts/phase1_builder.py"
+)
+temporary_hits=()
+for path in "${temporary_paths[@]}"; do
+  if [ -e "$path" ]; then
+    temporary_hits+=("$path")
+  fi
+done
+while IFS= read -r path; do
+  temporary_hits+=("$path")
+done < <(find .github/workflows -maxdepth 1 -type f -name 'phase1-*' -print | sort)
+if [ "${#temporary_hits[@]}" -eq 0 ]; then
+  pass "no temporary Phase 1 automation or payloads"
+else
+  printf '%s\n' "${temporary_hits[@]}"
+  fail "temporary Phase 1 automation or payloads remain"
 fi
 
 section "Deployment boundary"

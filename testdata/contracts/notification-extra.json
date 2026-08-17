@@ -1,0 +1,14 @@
+{
+  "auctionId": "42001",
+  "solutionId": [
+    7,
+    9007199254740993
+  ],
+  "kind": "success",
+  "transaction": "0x0000000000000000000000000000000000000000000000000000000000000001",
+  "rank": 2,
+  "details": {
+    "objective": "123456789012345678901234567890",
+    "driverVersion": "pinned-fixture"
+  }
+}

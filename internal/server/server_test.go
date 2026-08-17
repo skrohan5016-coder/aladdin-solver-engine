@@ -37,10 +37,11 @@ func auctionJSON(deadline string) string {
 	    }
 	  },
 	  "orders": [{
-	    "uid": "0xdeadbeef",
+	    "uid": "0x11111111111111111111111111111111111111111111111111111111111111112222222222222222222222222222222222222222ffffffff",
 	    "sellToken": "0x000000000000000000000000000000000000000a",
 	    "buyToken": "0x000000000000000000000000000000000000000b",
 	    "sellAmount": "1000000000000000000",
+	    "fullSellAmount": "1000000000000000000",
 	    "buyAmount": "1",
 	    "fullBuyAmount": "1",
 	    "validTo": 4102444800,
@@ -52,7 +53,7 @@ func auctionJSON(deadline string) string {
 	    "sellTokenSource": "erc20",
 	    "buyTokenDestination": "erc20",
 	    "class": "market",
-	    "appData": "0x00",
+	    "appData": "0x0000000000000000000000000000000000000000000000000000000000000000",
 	    "signingScheme": "eip712",
 	    "signature": "0x00"
 	  }],
@@ -118,10 +119,11 @@ func TestSolveEndToEnd(t *testing.T) {
 	if len(s.Interactions) != 1 {
 		t.Fatalf("expected 1 interaction, got %v", s.Interactions)
 	}
-	// The driver expects the liquidity id as a JSON number here, even though
-	// the auction carries it as a string. Getting this wrong is silent failure.
-	if id, ok := s.Interactions[0]["id"].(float64); !ok || id != 7 {
-		t.Errorf("interaction id must be the numeric liquidity id 7, got %#v", s.Interactions[0]["id"])
+	if id, ok := s.Interactions[0]["id"].(string); !ok || id != "7" {
+		t.Errorf("interaction id must preserve the opaque string 7, got %#v", s.Interactions[0]["id"])
+	}
+	if internalize, ok := s.Interactions[0]["internalize"].(bool); !ok || internalize {
+		t.Errorf("internalize=false must be explicit, got %#v", s.Interactions[0]["internalize"])
 	}
 	if s.Gas == 0 {
 		t.Error("solution should carry a gas estimate")

@@ -21,8 +21,8 @@ func TestRecorderWritesVersionedPrivateEvidence(t *testing.T) {
 	fixed := time.Date(2026, 8, 16, 17, 45, 0, 123, time.UTC)
 	recorder.now = func() time.Time { return fixed }
 
-	auctionID := "auction-42"
-	auction := &api.Auction{ID: &auctionID, EffectiveGasPrice: "1"}
+	auctionID := "42"
+	auction := &api.Auction{ID: &auctionID, EffectiveGasPrice: "1", Deadline: "2099-12-31T23:59:59Z"}
 	result := solve.Result{
 		Solutions: []api.Solution{},
 		Stats:     solve.Stats{Orders: 3, Solutions: 0},
@@ -31,11 +31,12 @@ func TestRecorderWritesVersionedPrivateEvidence(t *testing.T) {
 		t.Fatal(err)
 	}
 	notification := api.Notification{
-		AuctionID:  auctionID,
-		SolutionID: 7,
+		AuctionID:  &auctionID,
+		SolutionID: api.NewSingleNotificationSolutionID(7),
 		Kind:       "success",
 		Extra: map[string]json.RawMessage{
-			"rank": json.RawMessage(`2`),
+			"transaction": json.RawMessage(`"0x0000000000000000000000000000000000000000000000000000000000000001"`),
+			"rank":        json.RawMessage(`2`),
 		},
 	}
 	if err := recorder.Notification(notification); err != nil {
@@ -70,6 +71,9 @@ func TestRecorderWritesVersionedPrivateEvidence(t *testing.T) {
 	if notificationRecord.Schema != NotificationRecordSchema {
 		t.Fatalf("unexpected notification schema %q", notificationRecord.Schema)
 	}
+	if notificationRecord.Notify.SolutionIDString() != "7" {
+		t.Fatalf("notification solution id changed: %+v", notificationRecord.Notify)
+	}
 	if _, ok := notificationRecord.Notify.Extra["rank"]; !ok {
 		t.Fatalf("notification metadata was lost: %+v", notificationRecord.Notify)
 	}
@@ -89,11 +93,11 @@ func TestRecorderRotatesUsingTheRecordTimestamp(t *testing.T) {
 	}
 	current := time.Date(2026, 8, 16, 23, 59, 59, 0, time.UTC)
 	recorder.now = func() time.Time { return current }
-	if err := recorder.Notification(api.Notification{AuctionID: "a", Kind: "success"}); err != nil {
+	if err := recorder.Notification(api.Notification{Kind: "settlementStarted"}); err != nil {
 		t.Fatal(err)
 	}
 	current = current.Add(2 * time.Second)
-	if err := recorder.Notification(api.Notification{AuctionID: "b", Kind: "success"}); err != nil {
+	if err := recorder.Notification(api.Notification{Kind: "settlementStarted"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := recorder.Close(); err != nil {

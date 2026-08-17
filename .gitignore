@@ -10,3 +10,8 @@ config.local.*
 /bin/
 solver
 report
+contractcheck
+
+# Python helper caches
+__pycache__/
+*.py[cod]

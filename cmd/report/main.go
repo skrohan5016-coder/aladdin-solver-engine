@@ -33,9 +33,7 @@ type auctionRecord struct {
 
 type notifyRecord struct {
 	Notify struct {
-		AuctionID string  `json:"auctionId"`
-		Solution  float64 `json:"solutionId"`
-		Kind      string  `json:"kind"`
+		Kind string `json:"kind"`
 	} `json:"notify"`
 }
 

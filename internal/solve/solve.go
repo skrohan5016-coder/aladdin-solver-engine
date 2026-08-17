@@ -1,6 +1,7 @@
 package solve
 
 import (
+	"bytes"
 	"context"
 	"math/big"
 	"sort"
@@ -168,7 +169,7 @@ func eligible(orders []api.Order, max int) ([]api.Order, int) {
 	unsupported := 0
 	for _, order := range orders {
 		if len(order.PreInteractions) > 0 || len(order.PostInteractions) > 0 ||
-			len(order.Wrappers) > 0 || len(order.FeePolicies) > 0 {
+			len(order.Wrappers) > 0 || len(order.FeePolicies) > 0 || hasNonNullJSON(order.FlashloanHint) {
 			unsupported++
 			continue
 		}
@@ -194,6 +195,11 @@ func eligible(orders []api.Order, max int) ([]api.Order, int) {
 		}
 	}
 	return out, unsupported
+}
+
+func hasNonNullJSON(raw []byte) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null"))
 }
 
 type dropReason int

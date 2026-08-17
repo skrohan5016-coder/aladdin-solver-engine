@@ -12,8 +12,7 @@ stated evidence. The reviewed upstream source contract is pinned in
 
 ## Phase 0 — Recover a trustworthy baseline
 
-Status: implementation complete on Draft PR #2; final exact-head and merge-ref
-verification remain before human landing approval.
+Status: accepted and squash-merged as `27d0800324358c39f36f240b0fbd5920faf5ee67`.
 
 Deliverables:
 
@@ -42,6 +41,8 @@ Exit gate:
 
 ## Phase 1 — Continuously verify the CoW wire contract
 
+Status: implementation and fresh acceptance review complete on PR #3; exact-head approval remains before landing.
+
 Foundation already delivered in Phase 0:
 
 - exact `cowprotocol/services` commit and authoritative file blob SHAs;
@@ -49,23 +50,26 @@ Foundation already delivered in Phase 0:
 - extensible notification metadata preservation;
 - rejection of duplicate JSON keys at every depth.
 
-Remaining deliverables:
+Delivered in Phase 1:
 
-- retain representative auction, solution and notification fixtures from the
+- retained representative auction, solution and notification fixtures from the
   pinned contract;
-- add compatibility tests for every consumed and emitted field;
-- detect upstream schema drift before shadow deployment;
-- add additional cross-language reference vectors for every pool arithmetic
+- compatibility tests for consumed and emitted fields, including runtime scalar
+  bounds and notification variant payloads;
+- upstream schema-drift detection before shadow deployment;
+- additional cross-language reference vectors for every pool arithmetic
   implementation;
-- reject any newly introduced field when ignoring it could change settlement
-  semantics.
+- rejection of newly introduced fields when ignoring them could change
+  settlement semantics.
 
 Exit gate:
 
 - fixture replay is deterministic byte-for-byte after normalization;
 - every emitted solution validates against the pinned contract;
 - optional upstream notification metadata survives record and replay;
-- moving the pin requires a dedicated reviewed pull request.
+- moving the pin requires a dedicated reviewed pull request;
+- the exact final PR head and GitHub merge ref pass CI before Rohan approves the
+  exact SHA for landing.
 
 ## Phase 2 — Build a reproducible offline replay corpus
 

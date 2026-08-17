@@ -1,0 +1,77 @@
+{
+  "concentratedLiquidity": [
+    {
+      "amountIn": "1000000000000000000",
+      "amountOut": "987158034397061298",
+      "feePips": 3000,
+      "liquidity": "100000000000000000000",
+      "sqrtPriceX96": "79228162514264337593543950336",
+      "zeroForOne": true
+    }
+  ],
+  "constantProduct": [
+    {
+      "amountIn": "1000",
+      "amountOut": "996",
+      "feeDen": "1000",
+      "feeNum": "3",
+      "reserveIn": "1000000",
+      "reserveOut": "1000000"
+    },
+    {
+      "amountIn": "1000000000000000000",
+      "amountOut": "1974316068794122597700",
+      "feeDen": "1000",
+      "feeNum": "3",
+      "reserveIn": "100000000000000000000",
+      "reserveOut": "200000000000000000000000"
+    }
+  ],
+  "schema": "aladdin-pool-reference-v1",
+  "sources": {
+    "concentratedLiquidity": "Uniswap V3 TickMath and single-range SwapMath integer formula",
+    "constantProduct": "Uniswap V2 getAmountOut integer formula",
+    "stable": "cowprotocol/services pinned Balancer V2 stable_math.rs integer formula"
+  },
+  "stable": [
+    {
+      "amountIn": "1000000000000000000",
+      "amountOut": "999599990106928821",
+      "amplificationRaw": "100000",
+      "balances": [
+        "1000000000000000000000000",
+        "1000000000000000000000000"
+      ],
+      "feeDen": "10000",
+      "feeNum": "4",
+      "scalingFactors": [
+        "1000000000000000000",
+        "1000000000000000000"
+      ],
+      "tokenIn": 0,
+      "tokenOut": 1
+    }
+  ],
+  "tickMath": [
+    {
+      "sqrtPriceX96": "4295128739",
+      "tick": -887272
+    },
+    {
+      "sqrtPriceX96": "79224201403219477170569942574",
+      "tick": -1
+    },
+    {
+      "sqrtPriceX96": "79228162514264337593543950336",
+      "tick": 0
+    },
+    {
+      "sqrtPriceX96": "79232123823359799118286999568",
+      "tick": 1
+    },
+    {
+      "sqrtPriceX96": "1461446703485210103287273052203988822378723970342",
+      "tick": 887272
+    }
+  ]
+}
