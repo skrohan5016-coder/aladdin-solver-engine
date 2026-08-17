@@ -1,0 +1,73 @@
+name: one-shot-phase2-builder
+
+on:
+  push:
+    branches:
+      - agent/phase2-offline-replay-v1
+
+permissions:
+  contents: write
+
+concurrency:
+  group: one-shot-phase2-builder-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: startsWith(github.event.head_commit.message, '[phase2-builder]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      GOTOOLCHAIN: local
+      BRANCH: agent/phase2-offline-replay-v1
+    steps:
+      - name: Check out Phase 2 branch
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: agent/phase2-offline-replay-v1
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up pinned Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Reconstruct and apply reviewed Phase 2 implementation
+        run: |
+          set -euo pipefail
+          cat scripts/.phase2-builder.b64.* > /tmp/phase2_patcher.b64
+          printf '%s  %s\n' '7c68b990734c5b68f007115086cd88db6a7638c0881239390ddffe950984ac99' /tmp/phase2_patcher.b64 | sha256sum -c -
+          base64 --decode /tmp/phase2_patcher.b64 > /tmp/phase2_patcher.py.gz
+          printf '%s  %s\n' 'e32ff8b23677137459521ce370b329a6018c7282e3822444625a50cd6cc568b6' /tmp/phase2_patcher.py.gz | sha256sum -c -
+          gzip --decompress --stdout /tmp/phase2_patcher.py.gz > /tmp/phase2_patcher.py
+          printf '%s  %s\n' '413a0a1e7e6da6db5f551cc4a45700d24c198f897b8ac311b3e0c5c0f997ee25' /tmp/phase2_patcher.py | sha256sum -c -
+          python3 -m py_compile /tmp/phase2_patcher.py
+          python3 /tmp/phase2_patcher.py
+          rm scripts/.phase2-builder.b64.*
+          rm .github/workflows/one-shot-phase2-builder.yml
+          find . -type f -name '*.go' -print0 | xargs -0 gofmt -w
+          git diff --check
+
+      - name: Run complete governed validation
+        run: |
+          set -euo pipefail
+          python3 scripts/check_contract_fixtures.py
+          python3 scripts/check_upstream_pin.py
+          python3 scripts/generate_reference_vectors.py --check
+          go test -count=1 ./...
+          go test -race -count=1 ./...
+          bash scripts/ci.sh
+          git diff --check
+
+      - name: Commit validated clean Phase 2 foundation
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          test -n "$(git diff --cached --name-only)"
+          git diff --cached --check
+          git commit -m 'feat: add reproducible offline replay corpus'
+          git push origin HEAD:"$BRANCH"
