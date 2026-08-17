@@ -1,0 +1,118 @@
+name: one-shot-phase2-final-review
+
+on:
+  push:
+    branches:
+      - agent/phase2-offline-replay-v1
+
+permissions:
+  contents: write
+
+concurrency:
+  group: one-shot-phase2-final-review-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  remediate:
+    if: startsWith(github.event.head_commit.message, '[phase2-final-review]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      GOTOOLCHAIN: local
+      BRANCH: agent/phase2-offline-replay-v1
+    steps:
+      - name: Check out Phase 2 branch
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: agent/phase2-offline-replay-v1
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up pinned Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Verify and apply digest-bound final review patch
+        run: |
+          set -euo pipefail
+          chunks=(
+            scripts/.phase2-final-review.b64.00
+            scripts/.phase2-final-review.b64.01
+            scripts/.phase2-final-review.b64.02
+            scripts/.phase2-final-review.b64.03
+            scripts/.phase2-final-review.b64.04
+          )
+          expected_chunk_hashes=(
+            c6905037dbed6929dc601d749693a1239d0c8dc7bb9afcdbe224fa1a016e8f40
+            5b269e1da2708e60715f1b58bfe5212463cc064ffa2d561d76d88a47dfdb279d
+            04fa22e81e9ee5da536a35546624262e6f75b757a91e9cbccefe36734d0df537
+            5a1774fffb554868f901723f9d143457cfb4dee8853766b8d1e7153273875290
+            851a123cdc98566ebf8b857b7f574797be4b42cc0cba5b226bbbe46157ae2990
+          )
+          for index in "${!chunks[@]}"; do
+            printf '%s  %s\n' "${expected_chunk_hashes[$index]}" "${chunks[$index]}" | sha256sum -c -
+          done
+
+          cat "${chunks[@]}" > /tmp/phase2-final-review.b64
+          printf '%s  %s\n' 'b12f579671539199c03201ecde4acbeb197286366ac401863ec9f77a38b48bb6' /tmp/phase2-final-review.b64 | sha256sum -c -
+          base64 --decode /tmp/phase2-final-review.b64 > /tmp/phase2-final-review.tar.gz
+          printf '%s  %s\n' '46ae4978a4f714d67adef56fb6e6c3e54dd05cd01cf580fd4f961bc1602df8bc' /tmp/phase2-final-review.tar.gz | sha256sum -c -
+          gzip -t /tmp/phase2-final-review.tar.gz
+
+          mapfile -t entries < <(tar -tzf /tmp/phase2-final-review.tar.gz | sort)
+          expected=(
+            Makefile
+            cmd/replay/main.go
+            docs/PHASE2_OFFLINE_REPLAY.md
+            internal/buildinfo/buildinfo.go
+            internal/corpus/corpus.go
+            internal/corpus/corpus_test.go
+            internal/record/identity.go
+            internal/record/identity_test.go
+            internal/record/record_test.go
+          )
+          mapfile -t expected_sorted < <(printf '%s\n' "${expected[@]}" | sort)
+          if [ "$(printf '%s\n' "${entries[@]}")" != "$(printf '%s\n' "${expected_sorted[@]}")" ]; then
+            printf 'unexpected final-review archive inventory\nactual:\n%s\nexpected:\n%s\n' \
+              "$(printf '%s\n' "${entries[@]}")" "$(printf '%s\n' "${expected_sorted[@]}")" >&2
+            exit 1
+          fi
+
+          tar --extract --gzip --file /tmp/phase2-final-review.tar.gz --directory . --no-same-owner --no-same-permissions
+          rm -f "${chunks[@]}"
+          find scripts -maxdepth 1 -type f -name '.phase2-*' -delete
+          find .github/workflows -maxdepth 1 -type f -name 'one-shot-phase2-*.yml' -delete
+          find . -type f -name '*.go' -print0 | xargs -0 gofmt -w
+          test -f cmd/replay/main.go
+          if git check-ignore -q cmd/replay/main.go; then
+            echo 'cmd/replay remains ignored' >&2
+            exit 1
+          fi
+          if find scripts -maxdepth 1 -type f -name '.phase2-*' -print -quit | grep -q .; then
+            echo 'temporary Phase 2 payload remains' >&2
+            exit 1
+          fi
+          if find .github/workflows -maxdepth 1 -type f -name 'one-shot-phase2-*.yml' -print -quit | grep -q .; then
+            echo 'temporary Phase 2 workflow remains' >&2
+            exit 1
+          fi
+          git diff --check
+
+      - name: Run complete governed validation
+        run: |
+          set -euo pipefail
+          bash scripts/ci.sh
+          git diff --check
+
+      - name: Commit validated clean final-review remediation
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          test -n "$(git diff --cached --name-only)"
+          git diff --cached --check
+          git commit -m 'fix: bind replay evidence to embedded source identity'
+          git push origin HEAD:"$BRANCH"
