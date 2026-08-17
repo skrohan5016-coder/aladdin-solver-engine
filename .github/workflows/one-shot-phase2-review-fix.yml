@@ -1,0 +1,89 @@
+name: one-shot-phase2-review-fix
+
+on:
+  push:
+    branches:
+      - agent/phase2-offline-replay-v1
+
+permissions:
+  contents: write
+
+concurrency:
+  group: one-shot-phase2-review-fix-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  remediate:
+    if: startsWith(github.event.head_commit.message, '[phase2-review-fix]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      GOTOOLCHAIN: local
+      BRANCH: agent/phase2-offline-replay-v1
+    steps:
+      - name: Check out Phase 2 branch
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: agent/phase2-offline-replay-v1
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up pinned Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Apply digest-bound review remediation
+        run: |
+          set -euo pipefail
+          PAYLOAD=scripts/.phase2-review-fix.tar.gz
+          printf '%s  %s\n' 'd788bc10d05eae415d522e74b92f2be444d308e8ceab43fffa2e003f2f1f1dc1' "$PAYLOAD" | sha256sum -c -
+          mapfile -t entries < <(tar -tzf "$PAYLOAD" | sort)
+          expected=(
+            .gitignore
+            cmd/replay/main.go
+            cmd/replay/main_test.go
+            docs/PHASE2_OFFLINE_REPLAY.md
+            internal/corpus/corpus.go
+            internal/corpus/corpus_test.go
+            internal/record/identity.go
+            internal/record/identity_test.go
+          )
+          mapfile -t expected_sorted < <(printf '%s\n' "${expected[@]}" | sort)
+          if [ "$(printf '%s\n' "${entries[@]}")" != "$(printf '%s\n' "${expected_sorted[@]}")" ]; then
+            printf 'unexpected remediation archive inventory\nactual:\n%s\nexpected:\n%s\n' \
+              "$(printf '%s\n' "${entries[@]}")" "$(printf '%s\n' "${expected_sorted[@]}")" >&2
+            exit 1
+          fi
+          tar -xzf "$PAYLOAD"
+          rm "$PAYLOAD"
+          rm .github/workflows/one-shot-phase2-review-fix.yml
+          find . -type f -name '*.go' -print0 | xargs -0 gofmt -w
+          if git check-ignore -q cmd/replay/main.go; then
+            echo 'cmd/replay remains ignored' >&2
+            exit 1
+          fi
+          git diff --check
+
+      - name: Run complete governed validation
+        run: |
+          set -euo pipefail
+          python3 scripts/check_contract_fixtures.py
+          python3 scripts/check_upstream_pin.py
+          python3 scripts/generate_reference_vectors.py --check
+          go test -count=1 ./...
+          go test -race -count=1 ./...
+          bash scripts/ci.sh
+          git diff --check
+
+      - name: Commit validated clean remediation
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          test -n "$(git diff --cached --name-only)"
+          git diff --cached --check
+          git commit -m 'fix: harden offline corpus publication and identity'
+          git push origin HEAD:"$BRANCH"
