@@ -75,11 +75,11 @@ func (limits Limits) normalized() (Limits, error) {
 }
 
 type BuildOptions struct {
-	Inputs             []string
-	OutputDir          string
-	Runtime            RuntimeIdentity
-	Limits             Limits
-	RedactSignatures   bool
+	Inputs           []string
+	OutputDir        string
+	Runtime          RuntimeIdentity
+	Limits           Limits
+	RedactSignatures bool
 }
 
 type VerifyOptions struct {
