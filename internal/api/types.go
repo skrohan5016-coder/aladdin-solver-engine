@@ -266,6 +266,9 @@ func (n *Notification) UnmarshalJSON(data []byte) error {
 		return errors.New("notification kind is empty")
 	}
 	delete(fields, "kind")
+	if err := validateNotificationKind(n.Kind, fields); err != nil {
+		return err
+	}
 	n.Extra = fields
 	return nil
 }

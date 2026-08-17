@@ -22,7 +22,7 @@ func TestRecorderWritesVersionedPrivateEvidence(t *testing.T) {
 	recorder.now = func() time.Time { return fixed }
 
 	auctionID := "42"
-	auction := &api.Auction{ID: &auctionID, EffectiveGasPrice: "1"}
+	auction := &api.Auction{ID: &auctionID, EffectiveGasPrice: "1", Deadline: "2099-12-31T23:59:59Z"}
 	result := solve.Result{
 		Solutions: []api.Solution{},
 		Stats:     solve.Stats{Orders: 3, Solutions: 0},
@@ -35,7 +35,8 @@ func TestRecorderWritesVersionedPrivateEvidence(t *testing.T) {
 		SolutionID: api.NewSingleNotificationSolutionID(7),
 		Kind:       "success",
 		Extra: map[string]json.RawMessage{
-			"rank": json.RawMessage(`2`),
+			"transaction": json.RawMessage(`"0x0000000000000000000000000000000000000000000000000000000000000001"`),
+			"rank":        json.RawMessage(`2`),
 		},
 	}
 	if err := recorder.Notification(notification); err != nil {
@@ -92,11 +93,11 @@ func TestRecorderRotatesUsingTheRecordTimestamp(t *testing.T) {
 	}
 	current := time.Date(2026, 8, 16, 23, 59, 59, 0, time.UTC)
 	recorder.now = func() time.Time { return current }
-	if err := recorder.Notification(api.Notification{Kind: "success"}); err != nil {
+	if err := recorder.Notification(api.Notification{Kind: "settlementStarted"}); err != nil {
 		t.Fatal(err)
 	}
 	current = current.Add(2 * time.Second)
-	if err := recorder.Notification(api.Notification{Kind: "success"}); err != nil {
+	if err := recorder.Notification(api.Notification{Kind: "settlementStarted"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := recorder.Close(); err != nil {

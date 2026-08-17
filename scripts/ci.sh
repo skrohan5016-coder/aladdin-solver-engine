@@ -117,6 +117,13 @@ else
   printf '%s\n' "$misplaced"
   fail "workflow is missing or misplaced"
 fi
+unexpected_workflows="$(find .github/workflows -maxdepth 1 -type f ! -name 'ci.yml' ! -name 'upstream-contract-drift.yml' -print | sort)"
+if [ -z "$unexpected_workflows" ]; then
+  pass "only governed permanent workflows are present"
+else
+  printf '%s\n' "$unexpected_workflows"
+  fail "temporary or ungoverned workflow remains"
+fi
 if grep -q 'actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09' .github/workflows/ci.yml &&
   grep -q 'actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16' .github/workflows/ci.yml; then
   pass "GitHub Actions are pinned by commit"
@@ -132,6 +139,7 @@ fi
 section "Repository cleanliness"
 temporary_paths=(
   ".phase1-review-trigger"
+  ".github/workflows/one-shot-phase1-finalize.yml"
   "scripts/.phase1_review_fix.py.gz"
   "scripts/phase1_acceptance.py"
   "scripts/phase1_builder.py"

@@ -82,7 +82,7 @@ func TestNotificationMatchesPinnedRuntimeDTO(t *testing.T) {
 	for _, data := range []string{
 		`{"kind":"timeout"}`,
 		`{"auctionId":null,"solutionId":null,"kind":"timeout"}`,
-		`{"auctionId":"42","solutionId":7,"kind":"success","transaction":"0x01"}`,
+		`{"auctionId":"42","solutionId":7,"kind":"success","transaction":"0x0000000000000000000000000000000000000000000000000000000000000001"}`,
 		`{"auctionId":"42","solutionId":[7,9007199254740993],"kind":"settlementStarted"}`,
 	} {
 		if err := ValidateNotificationJSON([]byte(data)); err != nil {

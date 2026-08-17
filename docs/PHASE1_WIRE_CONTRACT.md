@@ -32,7 +32,8 @@ Three reviewed discrepancies matter immediately:
 - a direct constant-product auction and its exact normalized solution;
 - an auction covering every upstream liquidity variant and settlement-semantic
   order field, including fees, wrappers and a flash-loan hint;
-- an extensible driver notification with nested unknown metadata.
+- an extensible driver notification with nested unknown metadata and the
+  variant-specific fields required by the pinned runtime DTO.
 
 `manifest.json` binds every fixture byte sequence by SHA-256 and to the accepted
 upstream commit. `cmd/contractcheck` validates the fixtures, replays the direct
@@ -42,10 +43,13 @@ auction, and proves notification metadata survives a decode/encode round trip.
 
 Auction objects, orders, supported liquidity variants and emitted solutions use
 strict field allow-lists. A newly introduced field is rejected until reviewed if
-silently ignoring it could change settlement execution or scoring. Notification
-objects intentionally remain extensible because upstream explicitly permits
-unstable extra metadata; their core fields are validated and all extras are
-preserved.
+silently ignoring it could change settlement execution or scoring. Auction IDs,
+token decimals, deadlines, order amounts and `validTo` values are also bounded by
+the scalar types of the pinned runtime DTO.
+
+Notification objects remain extensible because upstream may add non-semantic
+metadata. Their known `kind` variants and variant-specific required fields are
+validated first; unknown extra fields are then preserved losslessly.
 
 Orders carrying unsupported execution authority remain excluded from solving:
 
@@ -75,7 +79,7 @@ committed vectors differ.
 ## Drift and pin governance
 
 The normal CI path is fully offline and validates the accepted pin, fixtures,
-replay and arithmetic vectors. a separate weekly/manual workflow compares the
+replay and arithmetic vectors. A separate weekly/manual workflow compares the
 six authoritative files on upstream `main` against the accepted blobs and fails
 when they drift.
 
