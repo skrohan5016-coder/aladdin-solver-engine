@@ -1,0 +1,385 @@
+name: one-shot-phase2-review-hardening
+
+on:
+  push:
+    branches:
+      - agent/phase2-offline-replay-v1
+
+permissions:
+  contents: write
+
+concurrency:
+  group: phase2-final-mutation
+  cancel-in-progress: false
+
+jobs:
+  harden:
+    if: startsWith(github.event.head_commit.message, '[phase2-review-hardening]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: Check out Phase 2 branch
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: agent/phase2-offline-replay-v1
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up pinned Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Apply final reviewed hardening
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              file = Path(path)
+              text = file.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one replacement, found {count}: {old[:120]!r}")
+              file.write_text(text.replace(old, new, 1))
+
+          Path("internal/buildinfo/buildinfo.go").write_text('''// Package buildinfo exposes source and toolchain identity injected into built commands.
+          package buildinfo
+
+          import "runtime"
+
+          // Commit is set with -ldflags at build time. Commands that publish or replay
+          // evidence fail closed when this is not an exact lowercase 40-hex commit SHA.
+          var Commit = "unknown"
+
+          // Toolchain includes the exact Go version and target platform because replay
+          // evidence must not silently cross architecture or operating-system builds.
+          func Toolchain() string {
+          \treturn runtime.Version() + "/" + runtime.GOOS + "/" + runtime.GOARCH
+          }
+          ''')
+
+          solver = Path("cmd/solver/main.go")
+          text = solver.read_text()
+          text = text.replace('\t"runtime"\n', '')
+          text = text.replace('runtime.Version(),', 'buildinfo.Toolchain(),')
+          text = text.replace('env("ENGINE_COMMIT", buildinfo.Commit),', 'buildinfo.Commit,')
+          solver.write_text(text)
+
+          replay = Path("cmd/replay/main.go")
+          text = replay.read_text()
+          text = text.replace('\t"runtime"\n', '')
+          text = text.replace('Toolchain:      runtime.Version(),', 'Toolchain:      buildinfo.Toolchain(),')
+          if 'engine-commit' in text:
+              raise SystemExit("cmd/replay still exposes an engine-commit override")
+          replay.write_text(text)
+
+          record_go = Path("internal/record/record.go")
+          text = record_go.read_text()
+          old = '''\tdata, err := json.Marshal(record)
+\tif err != nil {
+\t\treturn fmt.Errorf("encode auction record: %w", err)
+\t}
+\treturn r.write(&r.auctions, "auctions", now, data)
+'''
+          new = '''\tdata, err := json.Marshal(record)
+\tif err != nil {
+\t\treturn fmt.Errorf("encode auction record: %w", err)
+\t}
+\tname := "auctions"
+\tif r.KeepAuctions {
+\t\tname = "auctions-" + r.identity.EngineCommit[:12] + "-" + r.identity.ConfigSHA256[:12]
+\t}
+\treturn r.write(&r.auctions, name, now, data)
+'''
+          if old not in text:
+              raise SystemExit("record.Auction write block does not match reviewed implementation")
+          record_go.write_text(text.replace(old, new, 1))
+
+          build = Path("internal/corpus/build.go")
+          text = build.read_text()
+          if '\t"time"\n' not in text:
+              text = text.replace('\t"sort"\n', '\t"sort"\n\t"time"\n')
+          marker = '''\tif source.ElapsedMs < 0 {
+\t\treturn Entry{}, record.RunIdentity{}, errors.New("negative solve latency")
+\t}
+'''
+          addition = marker + '''\tif _, err := time.Parse(time.RFC3339Nano, source.Timestamp); err != nil {
+\t\treturn Entry{}, record.RunIdentity{}, fmt.Errorf("invalid record timestamp: %w", err)
+\t}
+'''
+          if marker not in text:
+              raise SystemExit("missing elapsed validation marker")
+          build.write_text(text.replace(marker, addition, 1))
+
+          source = Path("internal/corpus/source.go")
+          text = source.read_text()
+          marker = '''\tsort.Slice(sources, func(i, j int) bool {
+\t\tif sources[i].SHA256 != sources[j].SHA256 {
+\t\t\treturn sources[i].SHA256 < sources[j].SHA256
+\t\t}
+\t\tif sources[i].Bytes != sources[j].Bytes {
+\t\t\treturn sources[i].Bytes < sources[j].Bytes
+\t\t}
+\t\treturn sources[i].Records < sources[j].Records
+\t})
+\treturn entries, expected, sources, nil
+'''
+          replacement = '''\tsort.Slice(sources, func(i, j int) bool {
+\t\tif sources[i].SHA256 != sources[j].SHA256 {
+\t\t\treturn sources[i].SHA256 < sources[j].SHA256
+\t\t}
+\t\tif sources[i].Bytes != sources[j].Bytes {
+\t\t\treturn sources[i].Bytes < sources[j].Bytes
+\t\t}
+\t\treturn sources[i].Records < sources[j].Records
+\t})
+\tfor index := 1; index < len(sources); index++ {
+\t\tif sources[index-1].SHA256 == sources[index].SHA256 {
+\t\t\treturn nil, record.RunIdentity{}, nil, errors.New("duplicate recorder source content")
+\t\t}
+\t}
+\treturn entries, expected, sources, nil
+'''
+          if marker not in text:
+              raise SystemExit("missing source sort block")
+          source.write_text(text.replace(marker, replacement, 1))
+
+          verify = Path("internal/corpus/verify.go")
+          text = verify.read_text()
+          marker = '''\tpreviousSource := ""
+\tsourceRecords := 0
+\tfor index, source := range manifest.Sources {
+'''
+          replacement = '''\tpreviousSource := ""
+\tsourceRecords := 0
+\tvar sourceBytes int64
+\tfor index, source := range manifest.Sources {
+'''
+          if marker not in text:
+              raise SystemExit("missing source validation declaration")
+          text = text.replace(marker, replacement, 1)
+          marker = '''\t\tif source.Bytes < 1 || source.Bytes > limits.MaxInputBytes {
+\t\t\treturn fmt.Errorf("manifest source %d byte count is outside limits", index)
+\t\t}
+'''
+          replacement = marker + '''\t\tif sourceBytes > limits.MaxInputBytes-source.Bytes {
+\t\t\treturn errors.New("manifest combined source bytes exceed limit")
+\t\t}
+\t\tsourceBytes += source.Bytes
+'''
+          if marker not in text:
+              raise SystemExit("missing source byte validation")
+          text = text.replace(marker, replacement, 1)
+          marker = '''func decodeEntries(data []byte, manifest Manifest, limits Limits) ([]Entry, error) {
+\tscanner := scannerForBytes(data, limits.MaxLineBytes)
+'''
+          replacement = '''func decodeEntries(data []byte, manifest Manifest, limits Limits) ([]Entry, error) {
+\tif len(data) == 0 || data[len(data)-1] != '\\n' {
+\t\treturn nil, errors.New("entry file is empty or has an unterminated final JSONL record")
+\t}
+\tscanner := scannerForBytes(data, limits.MaxLineBytes)
+'''
+          if marker not in text:
+              raise SystemExit("missing decodeEntries start")
+          verify.write_text(text.replace(marker, replacement, 1))
+
+          io_file = Path("internal/corpus/io.go")
+          text = io_file.read_text()
+          marker = '''\tparent, err := secureDirectory(filepath.Dir(absolute))
+\tif err != nil {
+\t\treturn err
+\t}
+\ttemporary, err := os.CreateTemp(parent, ".replay-report-*.tmp")
+'''
+          replacement = '''\tparent, err := secureDirectory(filepath.Dir(absolute))
+\tif err != nil {
+\t\treturn err
+\t}
+\tif _, err := os.Lstat(absolute); !errors.Is(err, os.ErrNotExist) {
+\t\tif err == nil {
+\t\t\treturn fmt.Errorf("report output already exists: %s", absolute)
+\t\t}
+\t\treturn err
+\t}
+\ttemporary, err := os.CreateTemp(parent, ".replay-report-*.tmp")
+'''
+          if marker not in text:
+              raise SystemExit("missing report parent block")
+          text = text.replace(marker, replacement, 1)
+          marker = '\treturn os.Rename(temporaryPath, absolute)\n'
+          replacement = '''\tif err := os.Rename(temporaryPath, absolute); err != nil {
+\t\treturn err
+\t}
+\treturn syncDirectory(parent)
+'''
+          if marker not in text:
+              raise SystemExit("missing report rename")
+          io_file.write_text(text.replace(marker, replacement, 1))
+
+          for path in [
+              "internal/record/record_test.go",
+              "internal/record/identity_test.go",
+              "internal/corpus/corpus_test.go",
+          ]:
+              file = Path(path)
+              text = file.read_text()
+              if '"runtime"' in text:
+                  text = text.replace('\t"runtime"\n', '')
+              if 'internal/buildinfo' not in text:
+                  anchor = '"github.com/skrohan5016-coder/aladdin-solver-engine/internal/'
+                  first = text.find(anchor)
+                  if first == -1:
+                      raise SystemExit(f"{path}: import anchor missing")
+                  line_start = text.rfind('\n', 0, first) + 1
+                  text = text[:line_start] + '\t"github.com/skrohan5016-coder/aladdin-solver-engine/internal/buildinfo"\n' + text[line_start:]
+              text = text.replace('runtime.Version()', 'buildinfo.Toolchain()')
+              file.write_text(text)
+
+          test = Path("internal/record/record_test.go")
+          text = test.read_text()
+          old = 'auctionPath := filepath.Join(dir, "auctions-2026-08-16.jsonl")\n\tauctionData, err := os.ReadFile(auctionPath)'
+          new = '''auctionFiles, err := filepath.Glob(filepath.Join(dir, "auctions-*.jsonl"))
+\tif err != nil || len(auctionFiles) != 1 {
+\t\tt.Fatalf("unexpected auction record files: %v %v", auctionFiles, err)
+\t}
+\tauctionPath := auctionFiles[0]
+\tauctionData, err := os.ReadFile(auctionPath)'''
+          if old not in text:
+              raise SystemExit("record test auction path marker missing")
+          test.write_text(text.replace(old, new, 1))
+
+          readme = Path("README.md")
+          text = readme.read_text()
+          text = text.replace('| `ENGINE_COMMIT` | build-injected | Exact lowercase 40-hex source SHA required for full recording |\n', '')
+          text = text.replace(
+              'the exact engine commit, Go toolchain, upstream pin and solver-configuration hash.',
+              'the exact engine commit, Go version/OS/architecture, upstream pin and solver-configuration hash.',
+          )
+          readme.write_text(text)
+
+          doc = Path("docs/PHASE2_OFFLINE_REPLAY.md")
+          text = doc.read_text()
+          text = text.replace(
+              '- the exact Go toolchain reported by the running binary;',
+              '- the exact Go version, operating system and architecture reported by the running binary;',
+          )
+          text = text.replace(
+              '`RECORD_FULL_AUCTIONS=true` therefore fails at startup unless `ENGINE_COMMIT`\nis injected into the binary or supplied as an exact environment value.',
+              '`RECORD_FULL_AUCTIONS=true` therefore fails at startup unless the exact commit\nwas injected into the binary at build time. Runtime flags and environment values\ncannot replace the binary source identity.',
+          )
+          doc.write_text(text)
+
+          service = Path("deploy/solver.service")
+          text = service.read_text().replace(
+              '# ENGINE_COMMIT to match the exact deployed 40-hex source SHA.',
+              '# an exact source SHA to have been injected into the deployed binary.',
+          )
+          service.write_text(text)
+          PY
+
+          cat > internal/corpus/final_hardening_test.go <<'EOF'
+          package corpus
+
+          import (
+          	"context"
+          	"encoding/json"
+          	"errors"
+          	"os"
+          	"path/filepath"
+          	"runtime"
+          	"testing"
+          )
+
+          func TestVerifyRejectsUnterminatedCanonicalEntryFile(t *testing.T) {
+          	input, identity := replayableInput(t)
+          	runtimeIdentity := RuntimeIdentity{EngineCommit: identity.EngineCommit, Toolchain: identity.Toolchain, UpstreamCommit: identity.UpstreamCommit}
+          	directory := filepath.Join(t.TempDir(), "corpus")
+          	if _, err := Build(context.Background(), BuildOptions{Inputs: []string{input}, OutputDir: directory, Runtime: runtimeIdentity}); err != nil {
+          		t.Fatal(err)
+          	}
+          	entriesPath := filepath.Join(directory, EntriesFile)
+          	entries, err := os.ReadFile(entriesPath)
+          	if err != nil {
+          		t.Fatal(err)
+          	}
+          	if len(entries) == 0 || entries[len(entries)-1] != '\n' {
+          		t.Fatal("builder did not emit newline-terminated JSONL")
+          	}
+          	entries = entries[:len(entries)-1]
+          	if err := os.WriteFile(entriesPath, entries, 0o640); err != nil {
+          		t.Fatal(err)
+          	}
+          	manifestPath := filepath.Join(directory, ManifestFile)
+          	manifestData, err := os.ReadFile(manifestPath)
+          	if err != nil {
+          		t.Fatal(err)
+          	}
+          	var manifest Manifest
+          	if err := json.Unmarshal(manifestData, &manifest); err != nil {
+          		t.Fatal(err)
+          	}
+          	manifest.Entries.SHA256 = digestBytes(entries)
+          	manifest.Entries.Bytes = int64(len(entries))
+          	manifestData, err = json.MarshalIndent(manifest, "", "  ")
+          	if err != nil {
+          		t.Fatal(err)
+          	}
+          	manifestData = append(manifestData, '\n')
+          	if err := os.WriteFile(manifestPath, manifestData, 0o640); err != nil {
+          		t.Fatal(err)
+          	}
+          	if _, err := VerifyAndReplay(context.Background(), VerifyOptions{CorpusDir: directory, Runtime: runtimeIdentity}); err == nil {
+          		t.Fatal("unterminated entry file was accepted after manifest reseal")
+          	}
+          }
+
+          func TestWriteJSONAtomicDoesNotOverwriteEvidence(t *testing.T) {
+          	path := filepath.Join(t.TempDir(), "report.json")
+          	if err := WriteJSONAtomic(path, map[string]int{"first": 1}, 0o640); err != nil {
+          		t.Fatal(err)
+          	}
+          	if err := WriteJSONAtomic(path, map[string]int{"second": 2}, 0o640); err == nil {
+          		t.Fatal("existing report was overwritten")
+          	}
+          }
+
+          func TestBuildRejectsSymlinkInput(t *testing.T) {
+          	if runtime.GOOS == "windows" {
+          		t.Skip("symlink permissions vary on Windows")
+          	}
+          	input, identity := replayableInput(t)
+          	link := filepath.Join(t.TempDir(), "input.jsonl")
+          	if err := os.Symlink(input, link); err != nil {
+          		t.Fatal(err)
+          	}
+          	runtimeIdentity := RuntimeIdentity{EngineCommit: identity.EngineCommit, Toolchain: identity.Toolchain, UpstreamCommit: identity.UpstreamCommit}
+          	_, err := Build(context.Background(), BuildOptions{Inputs: []string{link}, OutputDir: filepath.Join(t.TempDir(), "corpus"), Runtime: runtimeIdentity})
+          	if err == nil || errors.Is(err, os.ErrNotExist) {
+          		t.Fatalf("symlink input was not rejected safely: %v", err)
+          	}
+          }
+          EOF
+
+          rm -f docs/PHASE2_GATE_RESULT.md
+          find .github/workflows -maxdepth 1 -type f -name 'one-shot-phase2-*.yml' -delete
+          find . -type f -name '*.go' -print0 | xargs -0 gofmt -w
+          git diff --check
+          go test -count=1 ./internal/buildinfo ./internal/record ./internal/corpus ./cmd/replay ./cmd/solver
+          go test -race -count=1 ./internal/buildinfo ./internal/record ./internal/corpus ./cmd/replay ./cmd/solver
+          bash scripts/ci.sh
+
+      - name: Commit hardened reviewed tree
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          test -n "$(git diff --cached --name-only)"
+          git diff --cached --check
+          git commit -m 'fix: close final Phase 2 replay durability gaps'
+          git push origin HEAD:agent/phase2-offline-replay-v1

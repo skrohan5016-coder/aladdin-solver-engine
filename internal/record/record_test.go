@@ -9,12 +9,20 @@ import (
 	"time"
 
 	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/api"
+	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/buildinfo"
 	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/solve"
 )
 
 func TestRecorderWritesVersionedPrivateEvidence(t *testing.T) {
+	original := buildinfo.Commit
+	buildinfo.Commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	t.Cleanup(func() { buildinfo.Commit = original })
 	dir := t.TempDir()
-	recorder, err := New(dir, true)
+	recorder, err := NewWithOptions(dir, Options{
+		KeepAuctions: true,
+		Config:       solve.DefaultConfig(),
+		EngineCommit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,8 +63,11 @@ func TestRecorderWritesVersionedPrivateEvidence(t *testing.T) {
 	if err := json.Unmarshal(auctionData, &auctionRecord); err != nil {
 		t.Fatal(err)
 	}
-	if auctionRecord.Schema != AuctionRecordSchema || auctionRecord.Auction == nil {
+	if auctionRecord.Schema != AuctionRecordSchema || auctionRecord.Auction == nil || auctionRecord.Identity == nil {
 		t.Fatalf("unexpected auction record: %+v", auctionRecord)
+	}
+	if auctionRecord.Identity.Engine.Commit != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" || auctionRecord.Identity.ConfigSHA256 == "" {
+		t.Fatalf("missing replay identity: %+v", auctionRecord.Identity)
 	}
 
 	notificationPath := filepath.Join(dir, "notifications-2026-08-16.jsonl")
@@ -119,8 +130,6 @@ func TestRecorderReturnsOpenFailure(t *testing.T) {
 	fixed := time.Date(2026, 8, 16, 1, 0, 0, 0, time.UTC)
 	recorder.now = func() time.Time { return fixed }
 
-	// A directory at the expected file path makes OpenFile fail on every OS
-	// without depending on process privileges.
 	blocked := filepath.Join(dir, "auctions-2026-08-16.jsonl")
 	if err := os.Mkdir(blocked, 0o750); err != nil {
 		t.Fatal(err)

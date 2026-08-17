@@ -69,12 +69,19 @@ run_gate "go test" go test -count=1 ./...
 run_gate "go test -race" go test -race -count=1 ./...
 
 section "Build"
-run_gate "solver, report and contractcheck build" go build -trimpath ./cmd/solver ./cmd/report ./cmd/contractcheck
+run_gate "solver, report, replay and contractcheck build" go build -trimpath ./cmd/solver ./cmd/report ./cmd/replay ./cmd/contractcheck
 if grep -q '^FROM golang:1.24.13-alpine3.22@sha256:3641e0d9b931dc4f2f185dcd669c4679670e9277c8166a838ddb98a2d4389cb5 AS build$' Dockerfile &&
   grep -q '^FROM scratch$' Dockerfile; then
   pass "container bases are immutable"
 else
   fail "Dockerfile must use the reviewed Go digest and scratch runtime"
+fi
+if grep -q 'internal/buildinfo.Commit=$(COMMIT)' Makefile &&
+  grep -q '^ARG ENGINE_COMMIT=unknown$' Dockerfile &&
+  grep -q 'internal/buildinfo.Commit=${ENGINE_COMMIT}' Dockerfile; then
+  pass "source commit is embedded in governed builds"
+else
+  fail "solver and replay builds must embed an exact source commit"
 fi
 if command -v docker >/dev/null 2>&1; then
   run_gate "network-isolated container build" docker build --network=none -t aladdin-solver-engine:ci .

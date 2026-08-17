@@ -138,7 +138,7 @@ Configuration is environment-only:
 |---|---:|---|
 | `LISTEN_ADDR` | `127.0.0.1:8000` | Loopback HTTP bind address |
 | `RECORD_DIR` | `./data` | Append-only JSONL evidence directory |
-| `RECORD_FULL_AUCTIONS` | `false` | Retain full auctions for offline replay |
+| `RECORD_FULL_AUCTIONS` | `false` | Retain full auctions with source, toolchain and config identity for offline replay |
 | `REQUIRE_PROFITABLE` | `true` | Drop candidates whose estimated edge does not cover gas |
 | `SETTLEMENT_OVERHEAD_GAS` | `106000` | Fixed settlement gas estimate |
 | `PER_TRADE_GAS` | `60000` | Marginal gas estimate per trade |
@@ -161,7 +161,9 @@ identifiers for:
 
 Recorder open, encode, append, rotation and close failures are surfaced and
 logged rather than silently discarded. Full-auction recording is opt-in because
-it can include order signatures and consumes substantial disk space.
+it can include order signatures and consumes substantial disk space. It also
+requires a binary built with an exact embedded source commit; `make build` does
+this automatically from the current Git checkout.
 
 Generate a report with:
 
@@ -184,6 +186,31 @@ non-zero report failure instead of being skipped.
 Coverage alone is not proof of competitiveness. A winner-beating rate requires
 winner or objective evidence bound to the same auctions; the current report
 states that limitation explicitly.
+
+## Offline corpus and deterministic replay
+
+Full-auction JSONL evidence can be sealed into a new immutable corpus:
+
+```sh
+make pack-corpus RECORDS='./data/auctions-*.jsonl' CORPUS=./private-corpus
+```
+
+The packer verifies the recorded result before publishing, binds every file by
+SHA-256, records the exact engine commit, Go toolchain, upstream contract and
+resolved solver configuration, writes the manifest last, and refuses existing
+or symlinked destinations. Signatures are redacted by default only after proving
+that redaction does not change solver output.
+
+Replay the corpus entirely offline with:
+
+```sh
+make replay-corpus CORPUS=./private-corpus
+```
+
+The replay command rejects partial records, unknown inventory, missing or extra
+files, symlinks, oversized files, digest mismatch, source/config/toolchain drift,
+and any changed solution or statistic. Its JSON report is deterministic for the
+same accepted corpus. See [docs/PHASE2_OFFLINE_REPLAY.md](docs/PHASE2_OFFLINE_REPLAY.md).
 
 ## License
 

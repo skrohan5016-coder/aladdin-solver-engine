@@ -1,0 +1,186 @@
+name: one-shot-phase2-source-seal
+
+on:
+  push:
+    branches:
+      - agent/phase2-offline-replay-v1
+
+permissions:
+  contents: write
+
+jobs:
+  seal:
+    if: startsWith(github.event.head_commit.message, '[phase2-source-seal]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: Check out Phase 2 branch
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: agent/phase2-offline-replay-v1
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up pinned Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Bind source file identities
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace(path: str, old: str, new: str) -> None:
+              file = Path(path)
+              text = file.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one replacement, found {count}: {old[:100]!r}")
+              file.write_text(text.replace(old, new, 1))
+
+          replace(
+              "internal/corpus/build.go",
+              '''\tentries, identity, err := readSourceRecords(ctx, options.Inputs, options.Runtime, limits, options.RedactSignatures)
+\tif err != nil {
+\t\treturn Manifest{}, err
+\t}
+''',
+              '''\tentries, wrappedIdentity, sources, err := readSealedSourceRecords(ctx, options.Inputs, options.Runtime, limits, options.RedactSignatures)
+\tif err != nil {
+\t\treturn Manifest{}, err
+\t}
+\tidentity := wrappedIdentity.RunIdentity
+''',
+          )
+          replace(
+              "internal/corpus/build.go",
+              '''\t\tConfigSHA256:   identity.ConfigSHA256,
+\t\tRedactions:     redactions,
+''',
+              '''\t\tConfigSHA256:   identity.ConfigSHA256,
+\t\tSources:        sources,
+\t\tRedactions:     redactions,
+''',
+          )
+
+          replace(
+              "internal/corpus/types.go",
+              '''type FileDescriptor struct {
+\tPath    string `json:"path"`
+\tSHA256  string `json:"sha256"`
+\tBytes   int64  `json:"bytes"`
+\tRecords int    `json:"records"`
+}
+''',
+              '''type SourceDescriptor struct {
+\tSHA256  string `json:"sha256"`
+\tBytes   int64  `json:"bytes"`
+\tRecords int    `json:"records"`
+}
+
+type FileDescriptor struct {
+\tPath    string `json:"path"`
+\tSHA256  string `json:"sha256"`
+\tBytes   int64  `json:"bytes"`
+\tRecords int    `json:"records"`
+}
+''',
+          )
+          replace(
+              "internal/corpus/types.go",
+              '''\tConfigSHA256   string                      `json:"configSha256"`
+\tRedactions     []string                    `json:"redactions"`
+''',
+              '''\tConfigSHA256   string                      `json:"configSha256"`
+\tSources        []SourceDescriptor          `json:"sources"`
+\tRedactions     []string                    `json:"redactions"`
+''',
+          )
+
+          verify = Path("internal/corpus/verify.go")
+          text = verify.read_text()
+          marker = '''\tif err := identity.Validate(); err != nil {
+\t\treturn fmt.Errorf("manifest run identity: %w", err)
+\t}
+'''
+          addition = marker + '''\tif len(manifest.Sources) == 0 {
+\t\treturn errors.New("manifest source descriptors are empty")
+\t}
+\tpreviousSource := ""
+\tsourceRecords := 0
+\tfor index, source := range manifest.Sources {
+\t\tif !validSHA256(source.SHA256) {
+\t\t\treturn fmt.Errorf("manifest source %d has malformed SHA-256", index)
+\t\t}
+\t\tif previousSource != "" && source.SHA256 <= previousSource {
+\t\t\treturn errors.New("manifest source descriptors are not strictly sorted and unique")
+\t\t}
+\t\tpreviousSource = source.SHA256
+\t\tif source.Bytes < 1 || source.Bytes > limits.MaxInputBytes {
+\t\t\treturn fmt.Errorf("manifest source %d byte count is outside limits", index)
+\t\t}
+\t\tif source.Records < 1 || source.Records > limits.MaxRecords {
+\t\t\treturn fmt.Errorf("manifest source %d record count is outside limits", index)
+\t\t}
+\t\tsourceRecords += source.Records
+\t}
+\tif sourceRecords != manifest.Entries.Records {
+\t\treturn fmt.Errorf("manifest source record total %d differs from entry count %d", sourceRecords, manifest.Entries.Records)
+\t}
+'''
+          if text.count(marker) != 1:
+              raise SystemExit("internal/corpus/verify.go: missing run identity validation block")
+          text = text.replace(marker, addition, 1)
+          text = text.replace(
+              'if len(manifest.Entries.SHA256) != 64 {',
+              'if !validSHA256(manifest.Entries.SHA256) {',
+              1,
+          )
+          verify.write_text(text)
+
+          doc = Path("docs/PHASE2_OFFLINE_REPLAY.md")
+          text = doc.read_text()
+          text = text.replace(
+              '- `manifest.json` — source, toolchain, upstream and configuration identity plus\n  the exact entry-file digest, byte count and record count;',
+              '- `manifest.json` — source, toolchain, upstream and configuration identity,\n  every recorder input SHA-256/byte/record count, and the exact entry-file\n  digest, byte count and record count;',
+          )
+          text = text.replace(
+              'It rejects malformed, blank, truncated, oversized, duplicate or mixed-identity\nrecords.',
+              'It rejects malformed, blank, truncated, non-newline-terminated, actively changing,\noversized, duplicate or mixed-identity records.',
+          )
+          doc.write_text(text)
+
+          readme = Path("README.md")
+          text = readme.read_text().replace(
+              'The manifest\nbinds the canonical entry file by SHA-256, byte count and record count and also\nrecords source, toolchain, upstream and configuration identity.',
+              'The manifest seals every recorder input and the canonical entry file by\nSHA-256, byte count and record count and also records source, toolchain,\nupstream and configuration identity.',
+          )
+          readme.write_text(text)
+          PY
+
+          rm -f docs/PHASE2_GATE_RESULT.md
+          rm -f .github/workflows/one-shot-phase2-source-seal.yml
+          rm -f .github/workflows/one-shot-phase2-hardening.yml
+          rm -f .github/workflows/one-shot-phase2-gate-report.yml
+          rm -f .github/workflows/one-shot-phase2-format-diagnose.yml
+          rm -f .github/workflows/one-shot-phase2-validate.yml
+          find . -type f -name '*.go' -print0 | xargs -0 gofmt -w
+          git diff --check
+          go test -count=1 ./internal/corpus ./internal/record ./cmd/replay ./cmd/solver
+          go test -race -count=1 ./internal/corpus ./internal/record ./cmd/replay ./cmd/solver
+
+      - name: Commit source-sealed clean tree
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          test -n "$(git diff --cached --name-only)"
+          git diff --cached --check
+          git commit -m 'feat: seal Phase 2 recorder source files'
+          git push origin HEAD:agent/phase2-offline-replay-v1

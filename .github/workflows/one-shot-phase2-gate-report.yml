@@ -1,0 +1,71 @@
+name: one-shot-phase2-gate-report
+
+on:
+  push:
+    branches:
+      - agent/phase2-offline-replay-v1
+
+permissions:
+  contents: write
+
+jobs:
+  gate-report:
+    if: startsWith(github.event.head_commit.message, '[phase2-gate-report]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: Check out Phase 2 branch
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: agent/phase2-offline-replay-v1
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up pinned Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Run gates and capture durable evidence
+        id: gates
+        run: |
+          set -uo pipefail
+          rm -f .github/workflows/one-shot-phase2-gate-report.yml
+          rm -f .github/workflows/one-shot-phase2-format-diagnose.yml
+          rm -f .github/workflows/one-shot-phase2-validate.yml
+          find . -type f -name '*.go' -print0 | xargs -0 gofmt -w
+          set +e
+          bash scripts/ci.sh > /tmp/phase2-gates.log 2>&1
+          status=$?
+          set -e
+          mkdir -p docs
+          {
+            echo '# Phase 2 Governed Gate Result'
+            echo
+            echo "Status: $([ "$status" -eq 0 ] && echo PASS || echo FAIL)"
+            echo
+            echo "Validated source parent: \`$(git rev-parse HEAD)\`"
+            echo
+            echo '```text'
+            tail -n 400 /tmp/phase2-gates.log
+            echo '```'
+          } > docs/PHASE2_GATE_RESULT.md
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+      - name: Commit report and clean tree
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          test -n "$(git diff --cached --name-only)"
+          git diff --cached --check
+          git commit -m 'test: record Phase 2 governed gate result'
+          git push origin HEAD:agent/phase2-offline-replay-v1
+
+      - name: Preserve failure conclusion
+        if: steps.gates.outputs.status != '0'
+        run: exit 1

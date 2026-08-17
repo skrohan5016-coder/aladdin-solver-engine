@@ -1,0 +1,1282 @@
+name: one-shot-phase2-reconcile
+
+on:
+  push:
+    branches:
+      - agent/phase2-offline-replay-v1
+
+permissions:
+  contents: write
+
+jobs:
+  reconcile:
+    if: startsWith(github.event.head_commit.message, '[phase2-reconcile]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: Check out Phase 2 branch
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: agent/phase2-offline-replay-v1
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up pinned Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Rebuild canonical Phase 2 implementation
+        run: |
+          set -euo pipefail
+
+          cat > internal/corpus/types.go <<'EOF'
+          // Package corpus publishes and verifies deterministic offline replay corpora.
+          package corpus
+
+          import (
+          	"errors"
+          	"fmt"
+
+          	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/api"
+          	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/record"
+          	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/solve"
+          )
+
+          const (
+          	ManifestSchema = "aladdin-offline-replay-manifest/v1"
+          	EntrySchema    = "aladdin-offline-replay-entry/v1"
+          	ReportSchema   = "aladdin-offline-replay-report/v1"
+          	EntriesFile    = "entries.jsonl"
+          	ManifestFile   = "manifest.json"
+
+          	DefaultMaxInputBytes  int64 = 512 << 20
+          	DefaultMaxCorpusBytes int64 = 512 << 20
+          	DefaultMaxLineBytes         = 128 << 20
+          	DefaultMaxRecords           = 10_000
+          )
+
+          type RuntimeIdentity struct {
+          	EngineCommit   string
+          	Toolchain      string
+          	UpstreamCommit string
+          }
+
+          type Limits struct {
+          	MaxInputBytes  int64
+          	MaxCorpusBytes int64
+          	MaxLineBytes   int
+          	MaxRecords     int
+          }
+
+          func DefaultLimits() Limits {
+          	return Limits{
+          		MaxInputBytes:  DefaultMaxInputBytes,
+          		MaxCorpusBytes: DefaultMaxCorpusBytes,
+          		MaxLineBytes:   DefaultMaxLineBytes,
+          		MaxRecords:     DefaultMaxRecords,
+          	}
+          }
+
+          func (limits Limits) normalized() (Limits, error) {
+          	defaults := DefaultLimits()
+          	if limits.MaxInputBytes == 0 {
+          		limits.MaxInputBytes = defaults.MaxInputBytes
+          	}
+          	if limits.MaxCorpusBytes == 0 {
+          		limits.MaxCorpusBytes = defaults.MaxCorpusBytes
+          	}
+          	if limits.MaxLineBytes == 0 {
+          		limits.MaxLineBytes = defaults.MaxLineBytes
+          	}
+          	if limits.MaxRecords == 0 {
+          		limits.MaxRecords = defaults.MaxRecords
+          	}
+          	if limits.MaxInputBytes < 1 || limits.MaxInputBytes > 1<<40 {
+          		return Limits{}, errors.New("max input bytes must be between 1 and 1 TiB")
+          	}
+          	if limits.MaxCorpusBytes < 1 || limits.MaxCorpusBytes > 1<<40 {
+          		return Limits{}, errors.New("max corpus bytes must be between 1 and 1 TiB")
+          	}
+          	if limits.MaxLineBytes < 1 || limits.MaxLineBytes > 1<<30 {
+          		return Limits{}, errors.New("max line bytes must be between 1 and 1 GiB")
+          	}
+          	if limits.MaxRecords < 1 || limits.MaxRecords > 10_000_000 {
+          		return Limits{}, errors.New("max records must be between 1 and 10000000")
+          	}
+          	return limits, nil
+          }
+
+          type BuildOptions struct {
+          	Inputs           []string
+          	OutputDir        string
+          	Runtime          RuntimeIdentity
+          	Limits           Limits
+          	RedactSignatures bool
+          }
+
+          type VerifyOptions struct {
+          	CorpusDir string
+          	Runtime   RuntimeIdentity
+          	Limits    Limits
+          }
+
+          type SourceDescriptor struct {
+          	SHA256  string `json:"sha256"`
+          	Bytes   int64  `json:"bytes"`
+          	Records int    `json:"records"`
+          }
+
+          type FileDescriptor struct {
+          	Path    string `json:"path"`
+          	SHA256  string `json:"sha256"`
+          	Bytes   int64  `json:"bytes"`
+          	Records int    `json:"records"`
+          }
+
+          type Manifest struct {
+          	Schema         string                      `json:"schema"`
+          	EngineCommit   string                      `json:"engineCommit"`
+          	Toolchain      string                      `json:"toolchain"`
+          	UpstreamCommit string                      `json:"upstreamCommit"`
+          	Config         record.SolverConfigIdentity `json:"config"`
+          	ConfigSHA256   string                      `json:"configSha256"`
+          	Sources        []SourceDescriptor          `json:"sources"`
+          	Redactions     []string                    `json:"redactions"`
+          	Entries        FileDescriptor              `json:"entries"`
+          }
+
+          type Expected struct {
+          	Solutions []api.Solution `json:"solutions"`
+          	Stats     solve.Stats    `json:"stats"`
+          }
+
+          type Entry struct {
+          	Schema    string      `json:"schema"`
+          	ID        string      `json:"id"`
+          	AuctionID string      `json:"auctionId"`
+          	Auction   api.Auction `json:"auction"`
+          	Expected  Expected    `json:"expected"`
+          }
+
+          type Result struct {
+          	EntryID      string `json:"entryId"`
+          	OutputSHA256 string `json:"outputSha256"`
+          }
+
+          type Report struct {
+          	Schema          string   `json:"schema"`
+          	ManifestSHA256  string   `json:"manifestSha256"`
+          	EngineCommit    string   `json:"engineCommit"`
+          	Toolchain       string   `json:"toolchain"`
+          	UpstreamCommit  string   `json:"upstreamCommit"`
+          	ConfigSHA256    string   `json:"configSha256"`
+          	EntryFileSHA256 string   `json:"entryFileSha256"`
+          	Entries         int      `json:"entries"`
+          	Results         []Result `json:"results"`
+          	AggregateSHA256 string   `json:"aggregateSha256"`
+          }
+
+          func validateRuntime(runtime RuntimeIdentity) error {
+          	if _, err := record.NewRunIdentity(
+          		runtime.EngineCommit,
+          		runtime.Toolchain,
+          		runtime.UpstreamCommit,
+          		solve.DefaultConfig(),
+          	); err != nil {
+          		return fmt.Errorf("runtime identity: %w", err)
+          	}
+          	return nil
+          }
+          EOF
+
+          cat > internal/corpus/io.go <<'EOF'
+          package corpus
+
+          import (
+          	"bufio"
+          	"bytes"
+          	"crypto/sha256"
+          	"encoding/hex"
+          	"encoding/json"
+          	"errors"
+          	"fmt"
+          	"io"
+          	"os"
+          	"path/filepath"
+          	"strings"
+
+          	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/contract"
+          )
+
+          func decodeStrict(data []byte, target any) error {
+          	if err := contract.ValidateUniqueJSON(data); err != nil {
+          		return err
+          	}
+          	decoder := json.NewDecoder(bytes.NewReader(data))
+          	decoder.DisallowUnknownFields()
+          	decoder.UseNumber()
+          	if err := decoder.Decode(target); err != nil {
+          		return err
+          	}
+          	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+          		if err == nil {
+          			return errors.New("multiple top-level JSON values")
+          		}
+          		return err
+          	}
+          	return nil
+          }
+
+          func canonicalJSON(value any) ([]byte, error) {
+          	data, err := json.Marshal(value)
+          	if err != nil {
+          		return nil, err
+          	}
+          	normalized, err := contract.NormalizeJSON(data)
+          	if err != nil {
+          		return nil, err
+          	}
+          	return bytes.TrimSuffix(normalized, []byte("\n")), nil
+          }
+
+          func digestBytes(data []byte) string {
+          	digest := sha256.Sum256(data)
+          	return hex.EncodeToString(digest[:])
+          }
+
+          func safeBaseName(name string) error {
+          	if name == "" || name == "." || name == ".." || filepath.IsAbs(name) ||
+          		filepath.Clean(name) != name || filepath.Base(name) != name || strings.ContainsAny(name, `/\`) {
+          		return fmt.Errorf("unsafe corpus path %q", name)
+          	}
+          	return nil
+          }
+
+          func secureDirectory(path string) (string, error) {
+          	absolute, err := filepath.Abs(path)
+          	if err != nil {
+          		return "", err
+          	}
+          	clean := filepath.Clean(absolute)
+          	info, err := os.Lstat(clean)
+          	if err != nil {
+          		return "", err
+          	}
+          	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+          		return "", fmt.Errorf("path is not a real directory: %s", clean)
+          	}
+          	resolved, err := filepath.EvalSymlinks(clean)
+          	if err != nil {
+          		return "", err
+          	}
+          	if filepath.Clean(resolved) != clean {
+          		return "", fmt.Errorf("directory contains a symlink boundary: %s", clean)
+          	}
+          	return clean, nil
+          }
+
+          func regularFile(path string, maxBytes int64) ([]byte, os.FileInfo, error) {
+          	file, info, err := openRegular(path, maxBytes)
+          	if err != nil {
+          		return nil, nil, err
+          	}
+          	data, readErr := io.ReadAll(io.LimitReader(file, maxBytes+1))
+          	after, statErr := file.Stat()
+          	closeErr := file.Close()
+          	if err := errors.Join(readErr, statErr, closeErr); err != nil {
+          		return nil, nil, err
+          	}
+          	if int64(len(data)) != info.Size() || after.Size() != info.Size() || !info.ModTime().Equal(after.ModTime()) {
+          		return nil, nil, fmt.Errorf("file changed while reading: %s", path)
+          	}
+          	if int64(len(data)) > maxBytes {
+          		return nil, nil, fmt.Errorf("file exceeds byte limit: %s", path)
+          	}
+          	return data, info, nil
+          }
+
+          func openRegular(path string, maxBytes int64) (*os.File, os.FileInfo, error) {
+          	absolute, err := filepath.Abs(path)
+          	if err != nil {
+          		return nil, nil, err
+          	}
+          	parent, err := secureDirectory(filepath.Dir(absolute))
+          	if err != nil {
+          		return nil, nil, err
+          	}
+          	clean := filepath.Join(parent, filepath.Base(absolute))
+          	before, err := os.Lstat(clean)
+          	if err != nil {
+          		return nil, nil, err
+          	}
+          	if before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() {
+          		return nil, nil, fmt.Errorf("path is not a regular file: %s", clean)
+          	}
+          	if before.Size() < 0 || before.Size() > maxBytes {
+          		return nil, nil, fmt.Errorf("file exceeds byte limit: %s (%d > %d)", clean, before.Size(), maxBytes)
+          	}
+          	file, err := os.Open(clean)
+          	if err != nil {
+          		return nil, nil, err
+          	}
+          	after, err := file.Stat()
+          	if err != nil {
+          		_ = file.Close()
+          		return nil, nil, err
+          	}
+          	if !after.Mode().IsRegular() || !os.SameFile(before, after) {
+          		_ = file.Close()
+          		return nil, nil, fmt.Errorf("file identity changed while opening: %s", clean)
+          	}
+          	return file, after, nil
+          }
+
+          func scannerFor(reader io.Reader, maxLineBytes int) *bufio.Scanner {
+          	scanner := bufio.NewScanner(reader)
+          	initial := 64 << 10
+          	if maxLineBytes < initial {
+          		initial = maxLineBytes
+          	}
+          	scanner.Buffer(make([]byte, initial), maxLineBytes)
+          	return scanner
+          }
+
+          func writeExclusive(path string, data []byte, mode os.FileMode) error {
+          	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
+          	if err != nil {
+          		return err
+          	}
+          	written, writeErr := file.Write(data)
+          	if writeErr == nil && written != len(data) {
+          		writeErr = io.ErrShortWrite
+          	}
+          	syncErr := file.Sync()
+          	closeErr := file.Close()
+          	return errors.Join(writeErr, syncErr, closeErr)
+          }
+
+          func WriteJSONAtomic(path string, value any, mode os.FileMode) error {
+          	data, err := json.MarshalIndent(value, "", "  ")
+          	if err != nil {
+          		return err
+          	}
+          	data = append(data, '\n')
+          	absolute, err := filepath.Abs(path)
+          	if err != nil {
+          		return err
+          	}
+          	parent, err := secureDirectory(filepath.Dir(absolute))
+          	if err != nil {
+          		return err
+          	}
+          	temporary, err := os.CreateTemp(parent, ".replay-report-*.tmp")
+          	if err != nil {
+          		return err
+          	}
+          	temporaryPath := temporary.Name()
+          	defer os.Remove(temporaryPath)
+          	if err := temporary.Chmod(mode); err != nil {
+          		_ = temporary.Close()
+          		return err
+          	}
+          	written, writeErr := temporary.Write(data)
+          	if writeErr == nil && written != len(data) {
+          		writeErr = io.ErrShortWrite
+          	}
+          	syncErr := temporary.Sync()
+          	closeErr := temporary.Close()
+          	if err := errors.Join(writeErr, syncErr, closeErr); err != nil {
+          		return err
+          	}
+          	return os.Rename(temporaryPath, absolute)
+          }
+          EOF
+
+          cat > internal/corpus/build.go <<'EOF'
+          package corpus
+
+          import (
+          	"bufio"
+          	"bytes"
+          	"context"
+          	"encoding/json"
+          	"errors"
+          	"fmt"
+          	"os"
+          	"path/filepath"
+          	"reflect"
+          	"sort"
+
+          	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/api"
+          	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/contract"
+          	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/record"
+          	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/solve"
+          )
+
+          func Build(ctx context.Context, options BuildOptions) (Manifest, error) {
+          	if err := validateRuntime(options.Runtime); err != nil {
+          		return Manifest{}, err
+          	}
+          	limits, err := options.Limits.normalized()
+          	if err != nil {
+          		return Manifest{}, err
+          	}
+          	if len(options.Inputs) == 0 {
+          		return Manifest{}, errors.New("at least one input JSONL file is required")
+          	}
+          	if options.OutputDir == "" {
+          		return Manifest{}, errors.New("output directory is empty")
+          	}
+
+          	entries, identity, sources, err := readSealedSourceRecords(ctx, options.Inputs, options.Runtime, limits, options.RedactSignatures)
+          	if err != nil {
+          		return Manifest{}, err
+          	}
+          	if len(entries) == 0 {
+          		return Manifest{}, errors.New("input contains no replayable auction records")
+          	}
+          	sort.Slice(entries, func(i, j int) bool { return entries[i].ID < entries[j].ID })
+
+          	absoluteOutput, err := filepath.Abs(options.OutputDir)
+          	if err != nil {
+          		return Manifest{}, err
+          	}
+          	if _, err := os.Lstat(absoluteOutput); !errors.Is(err, os.ErrNotExist) {
+          		if err == nil {
+          			return Manifest{}, fmt.Errorf("output already exists: %s", absoluteOutput)
+          		}
+          		return Manifest{}, err
+          	}
+          	parent, err := secureDirectory(filepath.Dir(absoluteOutput))
+          	if err != nil {
+          		return Manifest{}, err
+          	}
+          	temporary, err := os.MkdirTemp(parent, ".aladdin-corpus-*.tmp")
+          	if err != nil {
+          		return Manifest{}, err
+          	}
+          	published := false
+          	defer func() {
+          		if !published {
+          			_ = os.RemoveAll(temporary)
+          		}
+          	}()
+          	if err := os.Chmod(temporary, 0o750); err != nil {
+          		return Manifest{}, err
+          	}
+
+          	entriesData, err := encodeEntries(entries)
+          	if err != nil {
+          		return Manifest{}, err
+          	}
+          	if int64(len(entriesData)) > limits.MaxCorpusBytes {
+          		return Manifest{}, fmt.Errorf("canonical entry file exceeds byte limit: %d > %d", len(entriesData), limits.MaxCorpusBytes)
+          	}
+          	if err := writeExclusive(filepath.Join(temporary, EntriesFile), entriesData, 0o640); err != nil {
+          		return Manifest{}, fmt.Errorf("write entries: %w", err)
+          	}
+
+          	redactions := []string{}
+          	if options.RedactSignatures {
+          		redactions = append(redactions, "auction.orders[].signature")
+          	}
+          	manifest := Manifest{
+          		Schema:         ManifestSchema,
+          		EngineCommit:   identity.EngineCommit,
+          		Toolchain:      identity.Toolchain,
+          		UpstreamCommit: identity.UpstreamCommit,
+          		Config:         identity.Config,
+          		ConfigSHA256:   identity.ConfigSHA256,
+          		Sources:        sources,
+          		Redactions:     redactions,
+          		Entries: FileDescriptor{
+          			Path:    EntriesFile,
+          			SHA256:  digestBytes(entriesData),
+          			Bytes:   int64(len(entriesData)),
+          			Records: len(entries),
+          		},
+          	}
+          	manifestData, err := json.MarshalIndent(manifest, "", "  ")
+          	if err != nil {
+          		return Manifest{}, err
+          	}
+          	manifestData = append(manifestData, '\n')
+          	if err := writeExclusive(filepath.Join(temporary, ManifestFile), manifestData, 0o640); err != nil {
+          		return Manifest{}, fmt.Errorf("write manifest: %w", err)
+          	}
+          	if err := syncDirectory(temporary); err != nil {
+          		return Manifest{}, err
+          	}
+          	if err := os.Rename(temporary, absoluteOutput); err != nil {
+          		return Manifest{}, fmt.Errorf("publish corpus: %w", err)
+          	}
+          	published = true
+          	if err := syncDirectory(parent); err != nil {
+          		removeErr := os.RemoveAll(absoluteOutput)
+          		return Manifest{}, errors.Join(fmt.Errorf("sync corpus parent: %w", err), removeErr)
+          	}
+          	return manifest, nil
+          }
+
+          func entryFromSource(ctx context.Context, source record.AuctionRecord, runtimeIdentity RuntimeIdentity, redactSignatures bool) (Entry, record.RunIdentity, error) {
+          	if source.Schema != record.ReplayableAuctionRecordSchema {
+          		return Entry{}, record.RunIdentity{}, fmt.Errorf("record schema %q is not replayable", source.Schema)
+          	}
+          	if source.Run == nil {
+          		return Entry{}, record.RunIdentity{}, errors.New("replayable record is missing run identity")
+          	}
+          	identity := *source.Run
+          	if err := identity.Validate(); err != nil {
+          		return Entry{}, record.RunIdentity{}, fmt.Errorf("invalid run identity: %w", err)
+          	}
+          	if identity.EngineCommit != runtimeIdentity.EngineCommit || identity.Toolchain != runtimeIdentity.Toolchain || identity.UpstreamCommit != runtimeIdentity.UpstreamCommit {
+          		return Entry{}, record.RunIdentity{}, errors.New("record source, toolchain or upstream identity differs from the replay binary")
+          	}
+          	if source.Auction == nil {
+          		return Entry{}, record.RunIdentity{}, errors.New("replayable record is missing the full auction")
+          	}
+          	if source.ElapsedMs < 0 {
+          		return Entry{}, record.RunIdentity{}, errors.New("negative solve latency")
+          	}
+
+          	auction, err := cloneAuction(source.Auction)
+          	if err != nil {
+          		return Entry{}, record.RunIdentity{}, err
+          	}
+          	if redactSignatures {
+          		for index := range auction.Orders {
+          			auction.Orders[index].Signature = "0x"
+          		}
+          	}
+          	auctionData, err := json.Marshal(auction)
+          	if err != nil {
+          		return Entry{}, record.RunIdentity{}, err
+          	}
+          	if err := contract.ValidateAuctionJSON(auctionData); err != nil {
+          		return Entry{}, record.RunIdentity{}, fmt.Errorf("auction violates pinned contract: %w", err)
+          	}
+          	auctionID := ""
+          	if auction.ID != nil {
+          		auctionID = *auction.ID
+          	}
+          	if source.AuctionID != auctionID {
+          		return Entry{}, record.RunIdentity{}, fmt.Errorf("record auctionId %q differs from payload ID %q", source.AuctionID, auctionID)
+          	}
+
+          	actual := normalizeExpected(solve.Solve(ctx, &auction, identity.Config.SolveConfig()))
+          	recorded := normalizeExpected(solve.Result{Solutions: source.Solutions, Stats: source.Stats})
+          	if !reflect.DeepEqual(actual, recorded) {
+          		return Entry{}, record.RunIdentity{}, errors.New("recorded solutions or stats do not reproduce under the recorded configuration")
+          	}
+          	entryID, err := entryID(auction, identity.ConfigSHA256)
+          	if err != nil {
+          		return Entry{}, record.RunIdentity{}, err
+          	}
+          	return Entry{
+          		Schema:    EntrySchema,
+          		ID:        entryID,
+          		AuctionID: auctionID,
+          		Auction:   auction,
+          		Expected:  actual,
+          	}, identity, nil
+          }
+
+          func normalizeExpected(result solve.Result) Expected {
+          	if result.Solutions == nil {
+          		result.Solutions = []api.Solution{}
+          	}
+          	if result.Stats.PoolsSkipped == nil {
+          		result.Stats.PoolsSkipped = map[string]int{}
+          	}
+          	return Expected{Solutions: result.Solutions, Stats: result.Stats}
+          }
+
+          func cloneAuction(source *api.Auction) (api.Auction, error) {
+          	data, err := json.Marshal(source)
+          	if err != nil {
+          		return api.Auction{}, err
+          	}
+          	var clone api.Auction
+          	if err := json.Unmarshal(data, &clone); err != nil {
+          		return api.Auction{}, err
+          	}
+          	return clone, nil
+          }
+
+          func entryID(auction api.Auction, configSHA256 string) (string, error) {
+          	data, err := canonicalJSON(auction)
+          	if err != nil {
+          		return "", err
+          	}
+          	payload := make([]byte, 0, len(data)+1+len(configSHA256))
+          	payload = append(payload, data...)
+          	payload = append(payload, '\n')
+          	payload = append(payload, configSHA256...)
+          	return digestBytes(payload), nil
+          }
+
+          func encodeEntries(entries []Entry) ([]byte, error) {
+          	var buffer bytes.Buffer
+          	writer := bufio.NewWriter(&buffer)
+          	for _, entry := range entries {
+          		data, err := json.Marshal(entry)
+          		if err != nil {
+          			return nil, err
+          		}
+          		if _, err := writer.Write(data); err != nil {
+          			return nil, err
+          		}
+          		if err := writer.WriteByte('\n'); err != nil {
+          			return nil, err
+          		}
+          	}
+          	if err := writer.Flush(); err != nil {
+          		return nil, err
+          	}
+          	return buffer.Bytes(), nil
+          }
+
+          func syncDirectory(path string) error {
+          	directory, err := os.Open(path)
+          	if err != nil {
+          		return err
+          	}
+          	syncErr := directory.Sync()
+          	closeErr := directory.Close()
+          	return errors.Join(syncErr, closeErr)
+          }
+          EOF
+
+          cat > internal/corpus/source.go <<'EOF'
+          package corpus
+
+          import (
+          	"bufio"
+          	"bytes"
+          	"context"
+          	"crypto/sha256"
+          	"encoding/hex"
+          	"errors"
+          	"fmt"
+          	"io"
+          	"os"
+          	"path/filepath"
+          	"sort"
+
+          	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/record"
+          )
+
+          func readSealedSourceRecords(
+          	ctx context.Context,
+          	inputs []string,
+          	runtimeIdentity RuntimeIdentity,
+          	limits Limits,
+          	redactSignatures bool,
+          ) ([]Entry, record.RunIdentity, []SourceDescriptor, error) {
+          	paths := append([]string(nil), inputs...)
+          	sort.Strings(paths)
+          	seenPaths := map[string]struct{}{}
+          	seenEntries := map[string]struct{}{}
+          	seenAuctionIDs := map[string]string{}
+          	var expected record.RunIdentity
+          	var entries []Entry
+          	var sources []SourceDescriptor
+          	var totalBytes int64
+
+          	for _, input := range paths {
+          		if err := ctx.Err(); err != nil {
+          			return nil, record.RunIdentity{}, nil, err
+          		}
+          		absolute, err := filepath.Abs(input)
+          		if err != nil {
+          			return nil, record.RunIdentity{}, nil, err
+          		}
+          		if _, duplicate := seenPaths[absolute]; duplicate {
+          			return nil, record.RunIdentity{}, nil, fmt.Errorf("duplicate input path: %s", absolute)
+          		}
+          		seenPaths[absolute] = struct{}{}
+
+          		file, before, err := openRegular(absolute, limits.MaxInputBytes)
+          		if err != nil {
+          			return nil, record.RunIdentity{}, nil, err
+          		}
+          		totalBytes += before.Size()
+          		if totalBytes > limits.MaxInputBytes {
+          			_ = file.Close()
+          			return nil, record.RunIdentity{}, nil, fmt.Errorf("combined input exceeds byte limit: %d > %d", totalBytes, limits.MaxInputBytes)
+          		}
+          		if before.Size() == 0 {
+          			_ = file.Close()
+          			return nil, record.RunIdentity{}, nil, fmt.Errorf("empty recorder input: %s", absolute)
+          		}
+          		last := []byte{0}
+          		if _, err := file.ReadAt(last, before.Size()-1); err != nil {
+          			_ = file.Close()
+          			return nil, record.RunIdentity{}, nil, fmt.Errorf("read final source byte: %w", err)
+          		}
+          		if last[0] != '\n' {
+          			_ = file.Close()
+          			return nil, record.RunIdentity{}, nil, fmt.Errorf("recorder input has an unterminated final JSONL record: %s", absolute)
+          		}
+          		if _, err := file.Seek(0, io.SeekStart); err != nil {
+          			_ = file.Close()
+          			return nil, record.RunIdentity{}, nil, err
+          		}
+
+          		hasher := sha256.New()
+          		scanner := bufio.NewScanner(io.TeeReader(file, hasher))
+          		initial := 64 << 10
+          		if limits.MaxLineBytes < initial {
+          			initial = limits.MaxLineBytes
+          		}
+          		scanner.Buffer(make([]byte, initial), limits.MaxLineBytes)
+          		lineNumber := 0
+          		recordsBefore := len(entries)
+          		for scanner.Scan() {
+          			lineNumber++
+          			if err := ctx.Err(); err != nil {
+          				_ = file.Close()
+          				return nil, record.RunIdentity{}, nil, err
+          			}
+          			line := bytes.Clone(scanner.Bytes())
+          			if len(bytes.TrimSpace(line)) == 0 {
+          				_ = file.Close()
+          				return nil, record.RunIdentity{}, nil, fmt.Errorf("%s:%d: blank JSONL line", absolute, lineNumber)
+          			}
+          			var source record.AuctionRecord
+          			if err := decodeStrict(line, &source); err != nil {
+          				_ = file.Close()
+          				return nil, record.RunIdentity{}, nil, fmt.Errorf("%s:%d: decode auction record: %w", absolute, lineNumber, err)
+          			}
+          			entry, identity, err := entryFromSource(ctx, source, runtimeIdentity, redactSignatures)
+          			if err != nil {
+          				_ = file.Close()
+          				return nil, record.RunIdentity{}, nil, fmt.Errorf("%s:%d: %w", absolute, lineNumber, err)
+          			}
+          			if len(entries) == 0 {
+          				expected = identity
+          			} else if !expected.Equal(identity) {
+          				_ = file.Close()
+          				return nil, record.RunIdentity{}, nil, fmt.Errorf("%s:%d: run identity differs from earlier records", absolute, lineNumber)
+          			}
+          			if _, duplicate := seenEntries[entry.ID]; duplicate {
+          				_ = file.Close()
+          				return nil, record.RunIdentity{}, nil, fmt.Errorf("%s:%d: duplicate replay entry %s", absolute, lineNumber, entry.ID)
+          			}
+          			seenEntries[entry.ID] = struct{}{}
+          			if entry.AuctionID != "" {
+          				if prior, duplicate := seenAuctionIDs[entry.AuctionID]; duplicate && prior != entry.ID {
+          					_ = file.Close()
+          					return nil, record.RunIdentity{}, nil, fmt.Errorf("%s:%d: auction ID %q binds to multiple inputs", absolute, lineNumber, entry.AuctionID)
+          				}
+          				seenAuctionIDs[entry.AuctionID] = entry.ID
+          			}
+          			entries = append(entries, entry)
+          			if len(entries) > limits.MaxRecords {
+          				_ = file.Close()
+          				return nil, record.RunIdentity{}, nil, fmt.Errorf("record count exceeds limit: %d > %d", len(entries), limits.MaxRecords)
+          			}
+          		}
+          		scanErr := scanner.Err()
+          		after, statErr := file.Stat()
+          		closeErr := file.Close()
+          		if err := errors.Join(scanErr, statErr, closeErr); err != nil {
+          			return nil, record.RunIdentity{}, nil, fmt.Errorf("read %s: %w", absolute, err)
+          		}
+          		if !os.SameFile(before, after) || before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
+          			return nil, record.RunIdentity{}, nil, fmt.Errorf("recorder input changed while being read: %s", absolute)
+          		}
+          		recordCount := len(entries) - recordsBefore
+          		if recordCount == 0 {
+          			return nil, record.RunIdentity{}, nil, fmt.Errorf("recorder input contains no records: %s", absolute)
+          		}
+          		sources = append(sources, SourceDescriptor{
+          			SHA256:  hex.EncodeToString(hasher.Sum(nil)),
+          			Bytes:   before.Size(),
+          			Records: recordCount,
+          		})
+          	}
+          	sort.Slice(sources, func(i, j int) bool {
+          		if sources[i].SHA256 != sources[j].SHA256 {
+          			return sources[i].SHA256 < sources[j].SHA256
+          		}
+          		if sources[i].Bytes != sources[j].Bytes {
+          			return sources[i].Bytes < sources[j].Bytes
+          		}
+          		return sources[i].Records < sources[j].Records
+          	})
+          	return entries, expected, sources, nil
+          }
+          EOF
+
+          cat > internal/corpus/verify.go <<'EOF'
+          package corpus
+
+          import (
+          	"bytes"
+          	"context"
+          	"encoding/json"
+          	"errors"
+          	"fmt"
+          	"os"
+          	"path/filepath"
+          	"reflect"
+          	"sort"
+          	"strings"
+
+          	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/contract"
+          	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/record"
+          	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/solve"
+          )
+
+          func VerifyAndReplay(ctx context.Context, options VerifyOptions) (Report, error) {
+          	if err := validateRuntime(options.Runtime); err != nil {
+          		return Report{}, err
+          	}
+          	limits, err := options.Limits.normalized()
+          	if err != nil {
+          		return Report{}, err
+          	}
+          	if options.CorpusDir == "" {
+          		return Report{}, errors.New("corpus directory is empty")
+          	}
+          	directory, err := secureDirectory(options.CorpusDir)
+          	if err != nil {
+          		return Report{}, err
+          	}
+          	if err := verifyInventory(directory); err != nil {
+          		return Report{}, err
+          	}
+
+          	manifestData, _, err := regularFile(filepath.Join(directory, ManifestFile), limits.MaxCorpusBytes)
+          	if err != nil {
+          		return Report{}, err
+          	}
+          	var manifest Manifest
+          	if err := decodeStrict(manifestData, &manifest); err != nil {
+          		return Report{}, fmt.Errorf("decode manifest: %w", err)
+          	}
+          	canonicalManifest, err := json.MarshalIndent(manifest, "", "  ")
+          	if err != nil {
+          		return Report{}, err
+          	}
+          	canonicalManifest = append(canonicalManifest, '\n')
+          	if !bytes.Equal(manifestData, canonicalManifest) {
+          		return Report{}, errors.New("manifest bytes are not canonical")
+          	}
+          	if err := validateManifest(manifest, options.Runtime, limits); err != nil {
+          		return Report{}, err
+          	}
+          	entriesPath := filepath.Join(directory, manifest.Entries.Path)
+          	entriesData, info, err := regularFile(entriesPath, limits.MaxCorpusBytes)
+          	if err != nil {
+          		return Report{}, err
+          	}
+          	if info.Size() != manifest.Entries.Bytes || int64(len(entriesData)) != manifest.Entries.Bytes {
+          		return Report{}, errors.New("entry file byte count differs from manifest")
+          	}
+          	if digestBytes(entriesData) != manifest.Entries.SHA256 {
+          		return Report{}, errors.New("entry file SHA-256 differs from manifest")
+          	}
+
+          	entries, err := decodeEntries(entriesData, manifest, limits)
+          	if err != nil {
+          		return Report{}, err
+          	}
+          	results := make([]Result, 0, len(entries))
+          	config := manifest.Config.SolveConfig()
+          	var aggregate strings.Builder
+          	for _, entry := range entries {
+          		if err := ctx.Err(); err != nil {
+          			return Report{}, err
+          		}
+          		actual := normalizeExpected(solve.Solve(ctx, &entry.Auction, config))
+          		if !reflect.DeepEqual(actual, entry.Expected) {
+          			return Report{}, fmt.Errorf("entry %s replay output differs from committed expectation", entry.ID)
+          		}
+          		outputData, err := canonicalJSON(actual)
+          		if err != nil {
+          			return Report{}, err
+          		}
+          		outputDigest := digestBytes(outputData)
+          		results = append(results, Result{EntryID: entry.ID, OutputSHA256: outputDigest})
+          		aggregate.WriteString(entry.ID)
+          		aggregate.WriteByte(':')
+          		aggregate.WriteString(outputDigest)
+          		aggregate.WriteByte('\n')
+          	}
+
+          	return Report{
+          		Schema:          ReportSchema,
+          		ManifestSHA256:  digestBytes(manifestData),
+          		EngineCommit:    manifest.EngineCommit,
+          		Toolchain:       manifest.Toolchain,
+          		UpstreamCommit:  manifest.UpstreamCommit,
+          		ConfigSHA256:    manifest.ConfigSHA256,
+          		EntryFileSHA256: manifest.Entries.SHA256,
+          		Entries:         len(entries),
+          		Results:         results,
+          		AggregateSHA256: digestBytes([]byte(aggregate.String())),
+          	}, nil
+          }
+
+          func validateManifest(manifest Manifest, runtimeIdentity RuntimeIdentity, limits Limits) error {
+          	if manifest.Schema != ManifestSchema {
+          		return fmt.Errorf("unexpected manifest schema %q", manifest.Schema)
+          	}
+          	if manifest.EngineCommit != runtimeIdentity.EngineCommit || manifest.Toolchain != runtimeIdentity.Toolchain || manifest.UpstreamCommit != runtimeIdentity.UpstreamCommit {
+          		return errors.New("manifest source, toolchain or upstream identity differs from the replay binary")
+          	}
+          	identity := record.RunIdentity{
+          		Schema:         record.RunIdentitySchema,
+          		EngineCommit:   manifest.EngineCommit,
+          		Toolchain:      manifest.Toolchain,
+          		UpstreamCommit: manifest.UpstreamCommit,
+          		Config:         manifest.Config,
+          		ConfigSHA256:   manifest.ConfigSHA256,
+          	}
+          	if err := identity.Validate(); err != nil {
+          		return fmt.Errorf("manifest run identity: %w", err)
+          	}
+          	if len(manifest.Sources) == 0 {
+          		return errors.New("manifest source descriptors are empty")
+          	}
+          	previousSource := ""
+          	sourceRecords := 0
+          	for index, source := range manifest.Sources {
+          		if !validSHA256(source.SHA256) {
+          			return fmt.Errorf("manifest source %d has malformed SHA-256", index)
+          		}
+          		if previousSource != "" && source.SHA256 <= previousSource {
+          			return errors.New("manifest source descriptors are not strictly sorted and unique")
+          		}
+          		previousSource = source.SHA256
+          		if source.Bytes < 1 || source.Bytes > limits.MaxInputBytes {
+          			return fmt.Errorf("manifest source %d byte count is outside limits", index)
+          		}
+          		if source.Records < 1 || source.Records > limits.MaxRecords {
+          			return fmt.Errorf("manifest source %d record count is outside limits", index)
+          		}
+          		sourceRecords += source.Records
+          	}
+          	if sourceRecords != manifest.Entries.Records {
+          		return fmt.Errorf("manifest source record total %d differs from entry count %d", sourceRecords, manifest.Entries.Records)
+          	}
+          	if err := safeBaseName(manifest.Entries.Path); err != nil {
+          		return err
+          	}
+          	if manifest.Entries.Path != EntriesFile {
+          		return fmt.Errorf("manifest entry path must be %q", EntriesFile)
+          	}
+          	if !validSHA256(manifest.Entries.SHA256) {
+          		return errors.New("manifest entry SHA-256 is malformed")
+          	}
+          	if manifest.Entries.Bytes < 1 || manifest.Entries.Bytes > limits.MaxCorpusBytes {
+          		return errors.New("manifest entry byte count is outside limits")
+          	}
+          	if manifest.Entries.Records < 1 || manifest.Entries.Records > limits.MaxRecords {
+          		return errors.New("manifest entry record count is outside limits")
+          	}
+          	if manifest.Redactions == nil {
+          		return errors.New("manifest redactions must be an explicit array")
+          	}
+          	allowedRedactions := map[string]struct{}{"auction.orders[].signature": {}}
+          	previousRedaction := ""
+          	for _, redaction := range manifest.Redactions {
+          		if _, ok := allowedRedactions[redaction]; !ok {
+          			return fmt.Errorf("unknown redaction rule %q", redaction)
+          		}
+          		if previousRedaction != "" && redaction <= previousRedaction {
+          			return errors.New("manifest redactions are not strictly sorted and unique")
+          		}
+          		previousRedaction = redaction
+          	}
+          	return nil
+          }
+
+          func decodeEntries(data []byte, manifest Manifest, limits Limits) ([]Entry, error) {
+          	scanner := scannerForBytes(data, limits.MaxLineBytes)
+          	entries := make([]Entry, 0, manifest.Entries.Records)
+          	seen := map[string]struct{}{}
+          	previous := ""
+          	lineNumber := 0
+          	for scanner.Scan() {
+          		lineNumber++
+          		line := bytes.Clone(scanner.Bytes())
+          		if len(bytes.TrimSpace(line)) == 0 {
+          			return nil, fmt.Errorf("entries:%d: blank JSONL line", lineNumber)
+          		}
+          		var entry Entry
+          		if err := decodeStrict(line, &entry); err != nil {
+          			return nil, fmt.Errorf("entries:%d: %w", lineNumber, err)
+          		}
+          		canonicalEntry, err := json.Marshal(entry)
+          		if err != nil {
+          			return nil, err
+          		}
+          		if !bytes.Equal(line, canonicalEntry) {
+          			return nil, fmt.Errorf("entries:%d: entry bytes are not canonical", lineNumber)
+          		}
+          		if entry.Schema != EntrySchema {
+          			return nil, fmt.Errorf("entries:%d: unexpected entry schema %q", lineNumber, entry.Schema)
+          		}
+          		if !validSHA256(entry.ID) {
+          			return nil, fmt.Errorf("entries:%d: malformed entry ID", lineNumber)
+          		}
+          		if previous != "" && entry.ID <= previous {
+          			return nil, fmt.Errorf("entries:%d: entries are not strictly sorted", lineNumber)
+          		}
+          		previous = entry.ID
+          		if _, duplicate := seen[entry.ID]; duplicate {
+          			return nil, fmt.Errorf("entries:%d: duplicate entry ID", lineNumber)
+          		}
+          		seen[entry.ID] = struct{}{}
+          		auctionData, err := json.Marshal(entry.Auction)
+          		if err != nil {
+          			return nil, err
+          		}
+          		if err := contract.ValidateAuctionJSON(auctionData); err != nil {
+          			return nil, fmt.Errorf("entries:%d: auction violates pinned contract: %w", lineNumber, err)
+          		}
+          		auctionID := ""
+          		if entry.Auction.ID != nil {
+          			auctionID = *entry.Auction.ID
+          		}
+          		if entry.AuctionID != auctionID {
+          			return nil, fmt.Errorf("entries:%d: auctionId differs from payload", lineNumber)
+          		}
+          		expectedID, err := entryID(entry.Auction, manifest.ConfigSHA256)
+          		if err != nil {
+          			return nil, err
+          		}
+          		if entry.ID != expectedID {
+          			return nil, fmt.Errorf("entries:%d: entry ID does not bind auction and config", lineNumber)
+          		}
+          		entry.Expected = normalizeExpected(solve.Result{Solutions: entry.Expected.Solutions, Stats: entry.Expected.Stats})
+          		entries = append(entries, entry)
+          		if len(entries) > limits.MaxRecords {
+          			return nil, errors.New("entry count exceeds limit")
+          		}
+          	}
+          	if err := scanner.Err(); err != nil {
+          		return nil, fmt.Errorf("scan entries: %w", err)
+          	}
+          	if len(entries) != manifest.Entries.Records {
+          		return nil, fmt.Errorf("entry count differs from manifest: got %d want %d", len(entries), manifest.Entries.Records)
+          	}
+          	return entries, nil
+          }
+
+          func verifyInventory(directory string) error {
+          	items, err := os.ReadDir(directory)
+          	if err != nil {
+          		return err
+          	}
+          	actual := make([]string, 0, len(items))
+          	for _, item := range items {
+          		if item.Type()&os.ModeSymlink != 0 || item.IsDir() {
+          			return fmt.Errorf("corpus contains non-regular entry %q", item.Name())
+          		}
+          		actual = append(actual, item.Name())
+          	}
+          	sort.Strings(actual)
+          	expected := []string{EntriesFile, ManifestFile}
+          	sort.Strings(expected)
+          	if !reflect.DeepEqual(actual, expected) {
+          		return fmt.Errorf("corpus inventory differs: got %v want %v", actual, expected)
+          	}
+          	return nil
+          }
+          EOF
+
+          cat > cmd/replay/main.go <<'EOF'
+          // Command replay builds and verifies deterministic offline replay corpora.
+          package main
+
+          import (
+          	"context"
+          	"encoding/json"
+          	"errors"
+          	"flag"
+          	"fmt"
+          	"os"
+          	"runtime"
+
+          	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/buildinfo"
+          	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/contract"
+          	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/corpus"
+          )
+
+          var sourceCommit = buildinfo.Commit
+
+          type stringList []string
+
+          func (values *stringList) String() string { return fmt.Sprint([]string(*values)) }
+          func (values *stringList) Set(value string) error {
+          	if value == "" {
+          		return errors.New("input path is empty")
+          	}
+          	*values = append(*values, value)
+          	return nil
+          }
+
+          func main() {
+          	if err := run(os.Args[1:]); err != nil {
+          		fmt.Fprintln(os.Stderr, "replay:", err)
+          		os.Exit(1)
+          	}
+          }
+
+          func run(arguments []string) error {
+          	if len(arguments) == 0 {
+          		return errors.New("expected build or verify subcommand")
+          	}
+          	switch arguments[0] {
+          	case "build":
+          		return runBuild(arguments[1:])
+          	case "verify":
+          		return runVerify(arguments[1:])
+          	default:
+          		return fmt.Errorf("unknown subcommand %q", arguments[0])
+          	}
+          }
+
+          func runBuild(arguments []string) error {
+          	flags := flag.NewFlagSet("replay build", flag.ContinueOnError)
+          	flags.SetOutput(os.Stderr)
+          	var inputs stringList
+          	flags.Var(&inputs, "input", "full-auction recorder JSONL path; repeatable")
+          	output := flags.String("out", "", "new corpus directory")
+          	redact := flags.Bool("redact-signatures", true, "replace order signatures with 0x in the corpus")
+          	maxInputBytes := flags.Int64("max-input-bytes", corpus.DefaultMaxInputBytes, "combined recorder input byte limit")
+          	maxCorpusBytes := flags.Int64("max-corpus-bytes", corpus.DefaultMaxCorpusBytes, "canonical corpus byte limit")
+          	maxLineBytes := flags.Int("max-line-bytes", corpus.DefaultMaxLineBytes, "maximum JSONL line bytes")
+          	maxRecords := flags.Int("max-records", corpus.DefaultMaxRecords, "maximum auction records")
+          	if err := flags.Parse(arguments); err != nil {
+          		return err
+          	}
+          	if flags.NArg() != 0 {
+          		return fmt.Errorf("unexpected build arguments: %v", flags.Args())
+          	}
+          	manifest, err := corpus.Build(context.Background(), corpus.BuildOptions{
+          		Inputs:           inputs,
+          		OutputDir:        *output,
+          		Runtime:          runtimeIdentity(),
+          		RedactSignatures: *redact,
+          		Limits: corpus.Limits{
+          			MaxInputBytes:  *maxInputBytes,
+          			MaxCorpusBytes: *maxCorpusBytes,
+          			MaxLineBytes:   *maxLineBytes,
+          			MaxRecords:     *maxRecords,
+          		},
+          	})
+          	if err != nil {
+          		return err
+          	}
+          	return writeJSON(os.Stdout, manifest)
+          }
+
+          func runVerify(arguments []string) error {
+          	flags := flag.NewFlagSet("replay verify", flag.ContinueOnError)
+          	flags.SetOutput(os.Stderr)
+          	directory := flags.String("corpus", "", "corpus directory")
+          	reportPath := flags.String("report", "", "optional atomic report output path")
+          	maxCorpusBytes := flags.Int64("max-corpus-bytes", corpus.DefaultMaxCorpusBytes, "canonical corpus byte limit")
+          	maxLineBytes := flags.Int("max-line-bytes", corpus.DefaultMaxLineBytes, "maximum JSONL line bytes")
+          	maxRecords := flags.Int("max-records", corpus.DefaultMaxRecords, "maximum auction records")
+          	if err := flags.Parse(arguments); err != nil {
+          		return err
+          	}
+          	if flags.NArg() != 0 {
+          		return fmt.Errorf("unexpected verify arguments: %v", flags.Args())
+          	}
+          	report, err := corpus.VerifyAndReplay(context.Background(), corpus.VerifyOptions{
+          		CorpusDir: *directory,
+          		Runtime:   runtimeIdentity(),
+          		Limits: corpus.Limits{
+          			MaxCorpusBytes: *maxCorpusBytes,
+          			MaxLineBytes:   *maxLineBytes,
+          			MaxRecords:     *maxRecords,
+          		},
+          	})
+          	if err != nil {
+          		return err
+          	}
+          	if *reportPath != "" {
+          		if err := corpus.WriteJSONAtomic(*reportPath, report, 0o640); err != nil {
+          			return fmt.Errorf("write report: %w", err)
+          		}
+          	}
+          	return writeJSON(os.Stdout, report)
+          }
+
+          func runtimeIdentity() corpus.RuntimeIdentity {
+          	return corpus.RuntimeIdentity{
+          		EngineCommit:   sourceCommit,
+          		Toolchain:      runtime.Version(),
+          		UpstreamCommit: contract.UpstreamCommit,
+          	}
+          }
+
+          func writeJSON(file *os.File, value any) error {
+          	encoder := json.NewEncoder(file)
+          	encoder.SetIndent("", "  ")
+          	return encoder.Encode(value)
+          }
+          EOF
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("cmd/solver/main.go")
+          text = path.read_text().replace('env("ENGINE_COMMIT", buildinfo.Commit),', 'buildinfo.Commit,')
+          path.write_text(text)
+
+          ci = Path("scripts/ci.sh")
+          text = ci.read_text()
+          text = text.replace(
+              'go build -trimpath ./cmd/solver ./cmd/report ./cmd/contractcheck',
+              'go build -trimpath ./cmd/solver ./cmd/report ./cmd/contractcheck ./cmd/replay',
+          )
+          if 'section "Offline replay corpus"' not in text:
+              marker = 'section "Static analysis"\n'
+              section = '''section "Offline replay corpus"
+          if [ -d cmd/replay ] && [ -d internal/corpus ] && [ -f docs/PHASE2_OFFLINE_REPLAY.md ]; then
+            pass "Phase 2 replay surfaces are present"
+          else
+            fail "Phase 2 replay command, package, or policy document is missing"
+          fi
+          run_gate "corpus and replay focused tests" go test -count=1 ./internal/corpus ./internal/record ./cmd/replay
+
+          '''
+              if marker not in text:
+                  raise SystemExit("scripts/ci.sh static-analysis marker missing")
+              text = text.replace(marker, section + marker, 1)
+          ci.write_text(text)
+          PY
+
+          rm -f internal/corpus/source_helpers.go
+          rm -f docs/PHASE2_GATE_RESULT.md
+          find .github/workflows -maxdepth 1 -type f -name 'one-shot-phase2-*.yml' -delete
+          find . -type f -name '*.go' -print0 | xargs -0 gofmt -w
+          git diff --check
+          grep -q './cmd/replay' scripts/ci.sh
+          grep -q 'Offline replay corpus' scripts/ci.sh
+          go test -count=1 ./internal/corpus ./internal/record ./cmd/replay ./cmd/solver
+          go test -race -count=1 ./internal/corpus ./internal/record ./cmd/replay ./cmd/solver
+          bash scripts/ci.sh
+
+      - name: Commit reconciled clean tree
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          test -n "$(git diff --cached --name-only)"
+          git diff --cached --check
+          git commit -m 'feat: reconcile Phase 2 reproducible replay corpus'
+          git push origin HEAD:agent/phase2-offline-replay-v1

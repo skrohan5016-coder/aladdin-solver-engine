@@ -16,6 +16,7 @@ UMask=0027
 
 Environment=LISTEN_ADDR=127.0.0.1:8000
 Environment=RECORD_DIR=/opt/solver/data
+Environment=RECORD_FULL_AUCTIONS=false
 Environment=LOG_LEVEL=info
 Environment=REQUIRE_PROFITABLE=true
 Environment=MAX_POOLS=2048

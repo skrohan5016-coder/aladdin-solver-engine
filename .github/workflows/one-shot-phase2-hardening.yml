@@ -1,0 +1,249 @@
+name: one-shot-phase2-hardening
+
+on:
+  push:
+    branches:
+      - agent/phase2-offline-replay-v1
+
+permissions:
+  contents: write
+
+jobs:
+  harden:
+    if: startsWith(github.event.head_commit.message, '[phase2-hardening]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: Check out Phase 2 branch
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: agent/phase2-offline-replay-v1
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up pinned Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Apply reviewed hardening
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace(path: str, old: str, new: str) -> None:
+              file = Path(path)
+              text = file.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one replacement, found {count}: {old[:80]!r}")
+              file.write_text(text.replace(old, new, 1))
+
+          replace(
+              "cmd/solver/main.go",
+              'env("ENGINE_COMMIT", buildinfo.Commit),',
+              'buildinfo.Commit,',
+          )
+
+          replay = Path("cmd/replay/main.go")
+          text = replay.read_text()
+          for line in [
+              '\tengineCommit := flags.String("engine-commit", sourceCommit, "exact replay binary source commit")\n',
+          ]:
+              if text.count(line) != 2:
+                  raise SystemExit(f"cmd/replay/main.go: expected two engine-commit flags, found {text.count(line)}")
+              text = text.replace(line, "")
+          if text.count('Runtime:          runtimeIdentity(*engineCommit),') != 1:
+              raise SystemExit("missing build runtime identity call")
+          text = text.replace('Runtime:          runtimeIdentity(*engineCommit),', 'Runtime:          runtimeIdentity(),', 1)
+          if text.count('Runtime:   runtimeIdentity(*engineCommit),') != 1:
+              raise SystemExit("missing verify runtime identity call")
+          text = text.replace('Runtime:   runtimeIdentity(*engineCommit),', 'Runtime:   runtimeIdentity(),', 1)
+          replace_text = 'func runtimeIdentity(commit string) corpus.RuntimeIdentity {\n\treturn corpus.RuntimeIdentity{\n\t\tEngineCommit:   commit,'
+          replacement = 'func runtimeIdentity() corpus.RuntimeIdentity {\n\treturn corpus.RuntimeIdentity{\n\t\tEngineCommit:   sourceCommit,'
+          if text.count(replace_text) != 1:
+              raise SystemExit("missing runtimeIdentity function")
+          replay.write_text(text.replace(replace_text, replacement, 1))
+
+          build = Path("internal/corpus/build.go")
+          text = build.read_text()
+          text = text.replace('\t"io"\n', '')
+          text = text.replace('\t"strings"\n', '')
+          if text.count('entryFromSource(source, runtimeIdentity, redactSignatures)') != 1:
+              raise SystemExit("missing entryFromSource call")
+          text = text.replace(
+              'entryFromSource(source, runtimeIdentity, redactSignatures)',
+              'entryFromSource(ctx, source, runtimeIdentity, redactSignatures)',
+              1,
+          )
+          old = 'func entryFromSource(source record.AuctionRecord, runtimeIdentity RuntimeIdentity, redactSignatures bool) (Entry, record.RunIdentity, error) {'
+          new = 'func entryFromSource(ctx context.Context, source record.AuctionRecord, runtimeIdentity RuntimeIdentity, redactSignatures bool) (Entry, record.RunIdentity, error) {'
+          if text.count(old) != 1:
+              raise SystemExit("missing entryFromSource signature")
+          text = text.replace(old, new, 1)
+          text = text.replace(
+              'solve.Solve(context.Background(), &auction, identity.Config.SolveConfig())',
+              'solve.Solve(ctx, &auction, identity.Config.SolveConfig())',
+              1,
+          )
+          text = text.replace('\nvar _ io.Reader\nvar _ = strings.Builder{}\n', '\n')
+          old = '''\tif err := syncDirectory(parent); err != nil {
+\t\treturn Manifest{}, err
+\t}
+\treturn manifest, nil
+'''
+          new = '''\tif err := syncDirectory(parent); err != nil {
+\t\tremoveErr := os.RemoveAll(absoluteOutput)
+\t\treturn Manifest{}, errors.Join(fmt.Errorf("sync corpus parent: %w", err), removeErr)
+\t}
+\treturn manifest, nil
+'''
+          if text.count(old) != 1:
+              raise SystemExit("missing post-publication sync block")
+          build.write_text(text.replace(old, new, 1))
+
+          io_path = Path("internal/corpus/io.go")
+          text = io_path.read_text()
+          start = text.index('func regularFile(')
+          end = text.index('\nfunc scannerFor(', start)
+          replacement = r'''func regularFile(path string, maxBytes int64) ([]byte, os.FileInfo, error) {
+	file, info, err := openRegular(path, maxBytes)
+	if err != nil {
+		return nil, nil, err
+	}
+	data, readErr := io.ReadAll(io.LimitReader(file, maxBytes+1))
+	after, statErr := file.Stat()
+	closeErr := file.Close()
+	if err := errors.Join(readErr, statErr, closeErr); err != nil {
+		return nil, nil, err
+	}
+	if int64(len(data)) != info.Size() || after.Size() != info.Size() {
+		return nil, nil, fmt.Errorf("file size changed while reading: %s", path)
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, nil, fmt.Errorf("file exceeds byte limit: %s", path)
+	}
+	return data, info, nil
+}
+
+func openRegular(path string, maxBytes int64) (*os.File, os.FileInfo, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	parent, err := secureDirectory(filepath.Dir(absolute))
+	if err != nil {
+		return nil, nil, err
+	}
+	clean := filepath.Join(parent, filepath.Base(absolute))
+	before, err := os.Lstat(clean)
+	if err != nil {
+		return nil, nil, err
+	}
+	if before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() {
+		return nil, nil, fmt.Errorf("path is not a regular file: %s", clean)
+	}
+	if before.Size() < 0 || before.Size() > maxBytes {
+		return nil, nil, fmt.Errorf("file exceeds byte limit: %s (%d > %d)", clean, before.Size(), maxBytes)
+	}
+	file, err := os.Open(clean)
+	if err != nil {
+		return nil, nil, err
+	}
+	after, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, nil, err
+	}
+	if !after.Mode().IsRegular() || !os.SameFile(before, after) {
+		_ = file.Close()
+		return nil, nil, fmt.Errorf("file identity changed while opening: %s", clean)
+	}
+	return file, after, nil
+}
+'''
+          io_path.write_text(text[:start] + replacement + text[end:])
+
+          verify = Path("internal/corpus/verify.go")
+          text = verify.read_text()
+          marker = '''\tif err := decodeStrict(manifestData, &manifest); err != nil {
+\t\treturn Report{}, fmt.Errorf("decode manifest: %w", err)
+\t}
+'''
+          addition = marker + '''\tcanonicalManifest, err := json.MarshalIndent(manifest, "", "  ")
+\tif err != nil {
+\t\treturn Report{}, err
+\t}
+\tcanonicalManifest = append(canonicalManifest, '\\n')
+\tif !bytes.Equal(manifestData, canonicalManifest) {
+\t\treturn Report{}, errors.New("manifest bytes are not canonical")
+\t}
+'''
+          if text.count(marker) != 1:
+              raise SystemExit("missing manifest decode block")
+          text = text.replace(marker, addition, 1)
+          marker = '''\t\tif err := decodeStrict(line, &entry); err != nil {
+\t\t\treturn nil, fmt.Errorf("entries:%d: %w", lineNumber, err)
+\t\t}
+'''
+          addition = marker + '''\t\tcanonicalEntry, err := json.Marshal(entry)
+\t\tif err != nil {
+\t\t\treturn nil, err
+\t\t}
+\t\tif !bytes.Equal(line, canonicalEntry) {
+\t\t\treturn nil, fmt.Errorf("entries:%d: entry bytes are not canonical", lineNumber)
+\t\t}
+'''
+          if text.count(marker) != 1:
+              raise SystemExit("missing entry decode block")
+          verify.write_text(text.replace(marker, addition, 1))
+
+          types = Path("internal/corpus/types.go")
+          text = types.read_text()
+          text = text.replace('DefaultMaxInputBytes  int64 = 1 << 30', 'DefaultMaxInputBytes  int64 = 512 << 20')
+          text = text.replace('DefaultMaxCorpusBytes int64 = 1 << 30', 'DefaultMaxCorpusBytes int64 = 512 << 20')
+          text = text.replace('DefaultMaxRecords           = 100_000', 'DefaultMaxRecords           = 10_000')
+          types.write_text(text)
+
+          readme = Path("README.md")
+          text = readme.read_text()
+          text = text.replace('| `ENGINE_COMMIT` | build-injected | Exact lowercase 40-hex source SHA required for full recording |\n', '')
+          text = text.replace(
+              '`RECORD_FULL_AUCTIONS=true` therefore fails at startup unless `ENGINE_COMMIT`\nis injected into the binary or supplied as an exact environment value.',
+              '`RECORD_FULL_AUCTIONS=true` therefore fails at startup unless the exact commit\nwas injected into the binary at build time.',
+          )
+          readme.write_text(text)
+
+          doc = Path("docs/PHASE2_OFFLINE_REPLAY.md")
+          text = doc.read_text()
+          text = text.replace(
+              '`RECORD_FULL_AUCTIONS=true` therefore fails at startup unless `ENGINE_COMMIT`\nis injected into the binary or supplied as an exact environment value.',
+              '`RECORD_FULL_AUCTIONS=true` therefore fails at startup unless the exact commit\nwas injected into the binary at build time. Runtime flags and environment values\ncannot replace the binary source identity.',
+          )
+          doc.write_text(text)
+          PY
+
+          rm -f docs/PHASE2_GATE_RESULT.md
+          rm -f .github/workflows/one-shot-phase2-hardening.yml
+          rm -f .github/workflows/one-shot-phase2-gate-report.yml
+          rm -f .github/workflows/one-shot-phase2-format-diagnose.yml
+          rm -f .github/workflows/one-shot-phase2-validate.yml
+          find . -type f -name '*.go' -print0 | xargs -0 gofmt -w
+          git diff --check
+          go test -count=1 ./internal/corpus ./internal/record ./cmd/replay ./cmd/solver
+          go test -race -count=1 ./internal/corpus ./internal/record ./cmd/replay ./cmd/solver
+
+      - name: Commit hardened clean tree
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          test -n "$(git diff --cached --name-only)"
+          git diff --cached --check
+          git commit -m 'fix: harden Phase 2 replay identity and corpus I/O'
+          git push origin HEAD:agent/phase2-offline-replay-v1

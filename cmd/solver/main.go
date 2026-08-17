@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/buildinfo"
 	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/record"
 	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/server"
 	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/solve"
@@ -37,7 +38,17 @@ func main() {
 	cfg.MaxOrders = envPositiveInt("MAX_ORDERS", cfg.MaxOrders)
 	cfg.MaxPools = envPositiveInt("MAX_POOLS", cfg.MaxPools)
 
-	recorder, err := record.New(env("RECORD_DIR", "./data"), envBool("RECORD_FULL_AUCTIONS", false))
+	cfg = solve.ResolveConfig(cfg)
+	keepAuctions := envBool("RECORD_FULL_AUCTIONS", false)
+	if keepAuctions && !buildinfo.ValidCommit(buildinfo.Commit) {
+		log.Error("full-auction recording requires an exact embedded engine commit", "commit", buildinfo.Commit)
+		os.Exit(1)
+	}
+	recorder, err := record.NewWithOptions(env("RECORD_DIR", "./data"), record.Options{
+		KeepAuctions: keepAuctions,
+		Config:       cfg,
+		EngineCommit: buildinfo.Commit,
+	})
 	if err != nil {
 		log.Error("recorder init failed", "err", err)
 		os.Exit(1)
@@ -67,6 +78,7 @@ func main() {
 	go func() {
 		log.Info("solver engine listening",
 			"addr", httpServer.Addr,
+			"engineCommit", buildinfo.Commit,
 			"requireProfitable", cfg.RequireProfitable,
 			"maxOrders", cfg.MaxOrders,
 			"maxPools", cfg.MaxPools,

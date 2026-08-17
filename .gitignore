@@ -8,9 +8,14 @@ config.local.*
 
 # Build output
 /bin/
-solver
-report
-contractcheck
+/solver
+/report
+/replay
+/contractcheck
+
+# Private sealed replay corpora
+/corpora/
+/private-corpus/
 
 # Python helper caches
 __pycache__/
