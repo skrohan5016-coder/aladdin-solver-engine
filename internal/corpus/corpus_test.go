@@ -47,6 +47,10 @@ func TestPackAndReplayAreDeterministic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if firstReport.GOOS != runtime.GOOS || firstReport.GOARCH != runtime.GOARCH ||
+		firstReport.RecordedGOOS != runtime.GOOS || firstReport.RecordedGOARCH != runtime.GOARCH {
+		t.Fatalf("replay report omitted platform identity: %+v", firstReport)
+	}
 	secondReport, err := Replay(context.Background(), firstDir, ReplayOptions{SourceCommit: testCommit})
 	if err != nil {
 		t.Fatal(err)
@@ -81,6 +85,7 @@ func TestPackAndReplayAreDeterministic(t *testing.T) {
 }
 
 func TestPackRejectsPartialFinalRecord(t *testing.T) {
+	useEmbeddedCommit(t, testCommit)
 	path := filepath.Join(t.TempDir(), "records.jsonl")
 	if err := os.WriteFile(path, []byte(`{"schema":"`+record.AuctionRecordSchema+`"}`), 0o600); err != nil {
 		t.Fatal(err)
@@ -167,6 +172,7 @@ func TestPackRefusesExistingDestination(t *testing.T) {
 
 func writeReplayRecord(t *testing.T, newline bool) string {
 	t.Helper()
+	useEmbeddedCommit(t, testCommit)
 	auctionBytes, err := os.ReadFile(filepath.Join("..", "..", "testdata", "contracts", "auction-direct.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -335,5 +341,95 @@ func TestPackRejectsSourceOverrideForIdentifiedBinary(t *testing.T) {
 	_, err := Pack(context.Background(), []string{writeReplayRecord(t, true)}, filepath.Join(t.TempDir(), "corpus"), PackOptions{SourceCommit: other})
 	if err == nil || !strings.Contains(err.Error(), "running binary source mismatch") {
 		t.Fatalf("embedded source override was not rejected: %v", err)
+	}
+}
+
+func useEmbeddedCommit(t *testing.T, commit string) {
+	t.Helper()
+	if buildinfo.Commit == commit {
+		return
+	}
+	original := buildinfo.Commit
+	buildinfo.Commit = commit
+	t.Cleanup(func() { buildinfo.Commit = original })
+}
+
+func TestPackRejectsUnidentifiedBinary(t *testing.T) {
+	path := writeReplayRecord(t, true)
+	buildinfo.Commit = "unknown"
+	_, err := Pack(context.Background(), []string{path}, filepath.Join(t.TempDir(), "corpus"), PackOptions{SourceCommit: testCommit})
+	if err == nil || !strings.Contains(err.Error(), "does not contain an exact embedded source commit") {
+		t.Fatalf("unidentified binary was allowed to claim a source commit: %v", err)
+	}
+}
+
+func TestReplayRejectsTotalByteBudget(t *testing.T) {
+	recordPath := writeReplayRecord(t, true)
+	dir := filepath.Join(t.TempDir(), "corpus")
+	manifest, err := Pack(context.Background(), []string{recordPath}, dir, PackOptions{SourceCommit: testCommit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var total int64
+	for _, entry := range manifest.Entries {
+		total += entry.AuctionBytes + entry.ExpectedBytes
+	}
+	if total <= 1 {
+		t.Fatalf("unexpected sealed size %d", total)
+	}
+	_, err = Replay(context.Background(), dir, ReplayOptions{SourceCommit: testCommit, MaxTotalBytes: total - 1})
+	if err == nil || !strings.Contains(err.Error(), "total replay limit") {
+		t.Fatalf("aggregate replay byte budget was not enforced: %v", err)
+	}
+}
+
+func TestReplayRejectsManifestAuctionIDMismatch(t *testing.T) {
+	recordPath := writeReplayRecord(t, true)
+	dir := filepath.Join(t.TempDir(), "corpus")
+	if _, err := Pack(context.Background(), []string{recordPath}, dir, PackOptions{SourceCommit: testCommit}); err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(dir, "manifest.json")
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest Manifest
+	if err := decodeStrict(data, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	manifest.Entries[0].AuctionID = "forged"
+	data, err = canonicalJSON(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = Replay(context.Background(), dir, ReplayOptions{SourceCommit: testCommit})
+	if err == nil || !strings.Contains(err.Error(), "does not match embedded auction id") {
+		t.Fatalf("manifest auction identity mismatch was not rejected: %v", err)
+	}
+}
+
+func TestEnsureRegularFileUnchangedRejectsMutation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "record.jsonl")
+	if err := os.WriteFile(path, []byte("one\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := openRegular(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	initial, err := file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("changed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureRegularFileUnchanged(path, file, initial, initial.Size()); err == nil {
+		t.Fatal("mutated input file was accepted as stable")
 	}
 }

@@ -9,10 +9,14 @@ import (
 	"time"
 
 	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/api"
+	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/buildinfo"
 	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/solve"
 )
 
 func TestRecorderWritesVersionedPrivateEvidence(t *testing.T) {
+	original := buildinfo.Commit
+	buildinfo.Commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	t.Cleanup(func() { buildinfo.Commit = original })
 	dir := t.TempDir()
 	recorder, err := NewWithOptions(dir, Options{
 		KeepAuctions: true,
@@ -126,8 +130,6 @@ func TestRecorderReturnsOpenFailure(t *testing.T) {
 	fixed := time.Date(2026, 8, 16, 1, 0, 0, 0, time.UTC)
 	recorder.now = func() time.Time { return fixed }
 
-	// A directory at the expected file path makes OpenFile fail on every OS
-	// without depending on process privileges.
 	blocked := filepath.Join(dir, "auctions-2026-08-16.jsonl")
 	if err := os.Mkdir(blocked, 0o750); err != nil {
 		t.Fatal(err)

@@ -77,6 +77,10 @@ type Report struct {
 	RecordedCommit    string `json:"recordedCommit"`
 	GoVersion         string `json:"goVersion"`
 	RecordedGoVersion string `json:"recordedGoVersion"`
+	GOOS              string `json:"goos"`
+	RecordedGOOS      string `json:"recordedGoos"`
+	GOARCH            string `json:"goarch"`
+	RecordedGOARCH    string `json:"recordedGoarch"`
 	ConfigSHA256      string `json:"configSha256"`
 	Cases             int    `json:"cases"`
 	ResultsSHA256     string `json:"resultsSha256"`
@@ -94,6 +98,7 @@ type PackOptions struct {
 type ReplayOptions struct {
 	SourceCommit     string
 	MaxFileBytes     int64
+	MaxTotalBytes    int64
 	MaxCases         int
 	RequireToolchain bool
 }
@@ -264,6 +269,9 @@ func Replay(ctx context.Context, corpusDir string, options ReplayOptions) (Repor
 		if err := decodeStrict(auctionBytes, &auction); err != nil {
 			return Report{}, fmt.Errorf("entry %d auction decode: %w", index, err)
 		}
+		if embeddedID := auctionID(&auction); entry.AuctionID != embeddedID {
+			return Report{}, fmt.Errorf("entry %d auction id %q does not match embedded auction id %q", index, entry.AuctionID, embeddedID)
+		}
 		var expected Expected
 		if err := decodeStrict(expectedBytes, &expected); err != nil {
 			return Report{}, fmt.Errorf("entry %d expected decode: %w", index, err)
@@ -304,6 +312,10 @@ func Replay(ctx context.Context, corpusDir string, options ReplayOptions) (Repor
 		RecordedCommit:    manifest.Engine.Commit,
 		GoVersion:         runtime.Version(),
 		RecordedGoVersion: manifest.Engine.GoVersion,
+		GOOS:              runtime.GOOS,
+		RecordedGOOS:      manifest.Engine.GOOS,
+		GOARCH:            runtime.GOARCH,
+		RecordedGOARCH:    manifest.Engine.GOARCH,
 		ConfigSHA256:      manifest.ConfigSHA256,
 		Cases:             len(manifest.Entries),
 		ResultsSHA256:     fmt.Sprintf("%x", resultHash.Sum(nil)),
@@ -343,6 +355,9 @@ func resolveReplayOptions(options ReplayOptions) ReplayOptions {
 	if options.MaxFileBytes <= 0 {
 		options.MaxFileBytes = defaultMaxFileBytes
 	}
+	if options.MaxTotalBytes <= 0 {
+		options.MaxTotalBytes = defaultMaxTotalBytes
+	}
 	if options.MaxCases <= 0 {
 		options.MaxCases = defaultMaxCases
 	}
@@ -364,15 +379,16 @@ func readAuctionRecords(path string, maxLineBytes int64, remaining int, remainin
 		return nil, 0, fmt.Errorf("open auction records %s: %w", path, err)
 	}
 	defer file.Close()
-	info, err := file.Stat()
+	initial, err := file.Stat()
 	if err != nil {
 		return nil, 0, err
 	}
-	if info.Size() <= 0 || info.Size() > remainingBytes {
-		return nil, 0, fmt.Errorf("%s: input size %d is outside 1..%d remaining corpus bytes", path, info.Size(), remainingBytes)
+	if initial.Size() <= 0 || initial.Size() > remainingBytes {
+		return nil, 0, fmt.Errorf("%s: input size %d is outside 1..%d remaining corpus bytes", path, initial.Size(), remainingBytes)
 	}
 	reader := bufio.NewReaderSize(file, 64<<10)
 	var records []record.AuctionRecord
+	var consumed int64
 	for lineNumber := 1; ; lineNumber++ {
 		line, err := readCompleteLine(reader, maxLineBytes)
 		if errors.Is(err, io.EOF) {
@@ -381,6 +397,10 @@ func readAuctionRecords(path string, maxLineBytes int64, remaining int, remainin
 		if err != nil {
 			return nil, 0, fmt.Errorf("%s:%d: %w", path, lineNumber, err)
 		}
+		if int64(len(line)) > remainingBytes-consumed {
+			return nil, 0, fmt.Errorf("%s: input grew beyond remaining corpus byte limit %d", path, remainingBytes)
+		}
+		consumed += int64(len(line))
 		if len(bytes.TrimSpace(line)) == 0 {
 			return nil, 0, fmt.Errorf("%s:%d: blank record line", path, lineNumber)
 		}
@@ -396,7 +416,10 @@ func readAuctionRecords(path string, maxLineBytes int64, remaining int, remainin
 			return nil, 0, fmt.Errorf("%s: record count exceeds remaining case limit %d", path, remaining)
 		}
 	}
-	return records, info.Size(), nil
+	if err := ensureRegularFileUnchanged(path, file, initial, consumed); err != nil {
+		return nil, 0, fmt.Errorf("%s: %w", path, err)
+	}
+	return records, consumed, nil
 }
 
 func readCompleteLine(reader *bufio.Reader, maxBytes int64) ([]byte, error) {
@@ -422,14 +445,18 @@ func readCompleteLine(reader *bufio.Reader, maxBytes int64) ([]byte, error) {
 	}
 }
 
+func auctionID(auction *api.Auction) string {
+	if auction == nil || auction.ID == nil {
+		return ""
+	}
+	return *auction.ID
+}
+
 func prepareRecord(ctx context.Context, item record.AuctionRecord, policy RedactionPolicy) (preparedCase, error) {
 	if _, err := time.Parse(time.RFC3339Nano, item.Timestamp); err != nil {
 		return preparedCase{}, fmt.Errorf("invalid record timestamp: %w", err)
 	}
-	embeddedID := ""
-	if item.Auction.ID != nil {
-		embeddedID = *item.Auction.ID
-	}
+	embeddedID := auctionID(item.Auction)
 	if item.AuctionID != embeddedID {
 		return preparedCase{}, fmt.Errorf("record auction id %q does not match embedded auction id %q", item.AuctionID, embeddedID)
 	}
@@ -613,6 +640,7 @@ func validateManifest(manifest Manifest, options ReplayOptions) error {
 	}
 	seenNames := map[string]struct{}{}
 	seenFiles := map[string]struct{}{}
+	var totalBytes int64
 	for index, entry := range manifest.Entries {
 		if entry.Name != fmt.Sprintf("case-%06d", index+1) {
 			return fmt.Errorf("entry %d has non-canonical name %q", index, entry.Name)
@@ -635,6 +663,12 @@ func validateManifest(manifest Manifest, options ReplayOptions) error {
 		}
 		if entry.AuctionBytes <= 0 || entry.ExpectedBytes <= 0 || entry.AuctionBytes > options.MaxFileBytes || entry.ExpectedBytes > options.MaxFileBytes {
 			return fmt.Errorf("entry %d has invalid byte bounds", index)
+		}
+		for _, size := range []int64{entry.AuctionBytes, entry.ExpectedBytes} {
+			if size > options.MaxTotalBytes-totalBytes {
+				return fmt.Errorf("corpus entry bytes exceed total replay limit %d", options.MaxTotalBytes)
+			}
+			totalBytes += size
 		}
 		if !validDigest(entry.AuctionSHA256) || !validDigest(entry.ExpectedSHA256) {
 			return fmt.Errorf("entry %d has invalid SHA-256", index)
@@ -679,7 +713,10 @@ func validateIdentity(identity record.ReplayIdentity, sourceCommit string, requi
 }
 
 func validateRunningSource(sourceCommit string) error {
-	if buildinfo.ValidCommit(buildinfo.Commit) && buildinfo.Commit != sourceCommit {
+	if !buildinfo.ValidCommit(buildinfo.Commit) {
+		return fmt.Errorf("running binary does not contain an exact embedded source commit: %q", buildinfo.Commit)
+	}
+	if buildinfo.Commit != sourceCommit {
 		return fmt.Errorf("running binary source mismatch: embedded %s requested %s", buildinfo.Commit, sourceCommit)
 	}
 	return nil
@@ -761,21 +798,40 @@ func readRegularBounded(path string, maxBytes int64) ([]byte, error) {
 		return nil, err
 	}
 	defer file.Close()
-	info, err := file.Stat()
+	initial, err := file.Stat()
 	if err != nil {
 		return nil, err
 	}
-	if info.Size() <= 0 || info.Size() > maxBytes {
-		return nil, fmt.Errorf("file size %d is outside 1..%d", info.Size(), maxBytes)
+	if initial.Size() <= 0 || initial.Size() > maxBytes {
+		return nil, fmt.Errorf("file size %d is outside 1..%d", initial.Size(), maxBytes)
 	}
 	data, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
 	if err != nil {
 		return nil, err
 	}
-	if int64(len(data)) != info.Size() {
-		return nil, errors.New("file size changed while reading")
+	if err := ensureRegularFileUnchanged(path, file, initial, int64(len(data))); err != nil {
+		return nil, err
 	}
 	return data, nil
+}
+
+func ensureRegularFileUnchanged(path string, file *os.File, initial os.FileInfo, consumed int64) error {
+	after, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	pathAfter, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if pathAfter.Mode()&os.ModeSymlink != 0 || !after.Mode().IsRegular() || !pathAfter.Mode().IsRegular() ||
+		!os.SameFile(initial, after) || !os.SameFile(after, pathAfter) {
+		return errors.New("file identity changed while reading")
+	}
+	if after.Size() != initial.Size() || consumed != initial.Size() || !after.ModTime().Equal(initial.ModTime()) {
+		return errors.New("file size or modification time changed while reading")
+	}
+	return nil
 }
 
 func readEntry(dir, name string, expectedBytes int64, expectedDigest string, maxBytes int64) ([]byte, error) {

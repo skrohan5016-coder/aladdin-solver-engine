@@ -12,7 +12,6 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/buildinfo"
 	"github.com/skrohan5016-coder/aladdin-solver-engine/internal/corpus"
 )
 
@@ -42,8 +41,9 @@ func runPack(arguments []string) error {
 	flags.SetOutput(os.Stderr)
 	records := flags.String("records", "", "comma-separated record files or glob patterns")
 	output := flags.String("out", "", "new corpus directory")
-	commit := flags.String("source-commit", buildinfo.Commit, "exact source commit used for replay")
+	commit := flags.String("source-commit", "", "optional assertion; must match the exact embedded source commit")
 	redaction := flags.String("redaction", string(corpus.RedactSignatures), "none or signatures")
+	maxTotalBytes := flags.Int64("max-total-bytes", 0, "maximum total recorder input bytes; 0 uses the governed default")
 	if err := flags.Parse(arguments); err != nil {
 		return err
 	}
@@ -54,6 +54,7 @@ func runPack(arguments []string) error {
 	manifest, err := corpus.Pack(context.Background(), paths, *output, corpus.PackOptions{
 		SourceCommit:    *commit,
 		RedactionPolicy: corpus.RedactionPolicy(*redaction),
+		MaxTotalBytes:   *maxTotalBytes,
 	})
 	if err != nil {
 		return err
@@ -66,11 +67,15 @@ func runVerify(arguments []string) error {
 	flags := flag.NewFlagSet("verify", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	dir := flags.String("dir", "", "sealed corpus directory")
-	commit := flags.String("source-commit", buildinfo.Commit, "exact source commit used for replay")
+	commit := flags.String("source-commit", "", "optional assertion; must match the exact embedded source commit")
+	maxTotalBytes := flags.Int64("max-total-bytes", 0, "maximum aggregate sealed entry bytes; 0 uses the governed default")
 	if err := flags.Parse(arguments); err != nil {
 		return err
 	}
-	report, err := corpus.Replay(context.Background(), *dir, corpus.ReplayOptions{SourceCommit: *commit})
+	report, err := corpus.Replay(context.Background(), *dir, corpus.ReplayOptions{
+		SourceCommit:  *commit,
+		MaxTotalBytes: *maxTotalBytes,
+	})
 	if err != nil {
 		return err
 	}

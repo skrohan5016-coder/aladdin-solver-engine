@@ -41,12 +41,12 @@ report: build
 pack-corpus: build
 	test -n "$(RECORDS)"
 	test -n "$(CORPUS)"
-	./bin/replay pack -records "$(RECORDS)" -out "$(CORPUS)" -source-commit "$(COMMIT)"
+	./bin/replay pack -records "$(RECORDS)" -out "$(CORPUS)"
 
 # Usage: make replay-corpus CORPUS=./private-corpus
 replay-corpus: build
 	test -n "$(CORPUS)"
-	./bin/replay verify -dir "$(CORPUS)" -source-commit "$(COMMIT)"
+	./bin/replay verify -dir "$(CORPUS)"
 
 clean:
 	rm -rf bin/

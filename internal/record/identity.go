@@ -27,22 +27,22 @@ func NewWithOptions(dir string, options Options) (*Recorder, error) {
 	if dir == "" {
 		return nil, fmt.Errorf("record directory is empty")
 	}
-	if err := os.MkdirAll(dir, 0o750); err != nil {
-		return nil, fmt.Errorf("create record directory: %w", err)
-	}
-	if err := os.Chmod(dir, 0o750); err != nil {
-		return nil, fmt.Errorf("secure record directory: %w", err)
-	}
 	config, digest, err := solve.SnapshotConfig(options.Config)
 	if err != nil {
 		return nil, fmt.Errorf("identify solver config: %w", err)
 	}
 	engine := buildinfo.Current()
-	if options.EngineCommit != "" {
-		engine.Commit = options.EngineCommit
+	if options.EngineCommit != "" && options.EngineCommit != engine.Commit {
+		return nil, fmt.Errorf("engine commit assertion mismatch: embedded %q requested %q", engine.Commit, options.EngineCommit)
 	}
 	if options.KeepAuctions && !buildinfo.ValidCommit(engine.Commit) {
-		return nil, fmt.Errorf("full-auction recording requires an exact engine commit, got %q", engine.Commit)
+		return nil, fmt.Errorf("full-auction recording requires an exact embedded engine commit, got %q", engine.Commit)
+	}
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return nil, fmt.Errorf("create record directory: %w", err)
+	}
+	if err := os.Chmod(dir, 0o750); err != nil {
+		return nil, fmt.Errorf("secure record directory: %w", err)
 	}
 	return &Recorder{
 		dir:          dir,

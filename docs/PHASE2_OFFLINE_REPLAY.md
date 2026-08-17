@@ -20,10 +20,12 @@ When `RECORD_FULL_AUCTIONS=true`, every auction record uses
 - SHA-256 of that configuration snapshot;
 - recorded solutions and diagnostic statistics.
 
-Full recording refuses to start when the binary does not contain an exact
-40-hex source commit. `make build` embeds the current Git commit. Container
-builds must pass `--build-arg ENGINE_COMMIT=<exact-sha>` before enabling full
-recording.
+Full recording, corpus packing, and replay verification refuse to start when
+the running binary does not contain an exact 40-hex source commit. `make build`
+embeds the current Git commit. Container builds must pass
+`--build-arg ENGINE_COMMIT=<exact-sha>` before enabling full recording or using
+the replay command. The optional `-source-commit` flag is assertion-only and
+cannot replace or override the embedded identity.
 
 ## Corpus publication
 
@@ -32,14 +34,13 @@ Create a new corpus from one or more daily recorder files:
 ```sh
 bin/replay pack \
   -records '/opt/solver/data/auctions-2026-08-*.jsonl' \
-  -out /opt/solver/corpora/august \
-  -source-commit <exact-engine-commit>
+  -out /opt/solver/corpora/august
 ```
 
 Publication is fail-closed:
 
 - every JSONL record must end in a newline;
-- every record line, total input byte volume, and case count are bounded and strictly decoded;
+- every record line, total recorder input byte volume, and case count are bounded and strictly decoded;
 - all records must share one source, toolchain, upstream, and config identity;
 - recorded solutions and statistics must reproduce before publication;
 - the destination must not already exist;
@@ -68,15 +69,17 @@ Verify a sealed corpus without network access:
 
 ```sh
 bin/replay verify \
-  -dir /opt/solver/corpora/august \
-  -source-commit <exact-engine-commit>
+  -dir /opt/solver/corpora/august
 ```
 
 The verifier checks the exact inventory, byte lengths, SHA-256 values, schemas,
-source commit, pinned upstream commit, Go version, operating system, architecture, and config digest. It then
-replays every auction and compares canonical expected solutions and statistics.
-The emitted replay report contains deterministic corpus and result digests; two
-runs over the same accepted corpus produce identical report bytes.
+source commit, pinned upstream commit, Go version, operating system,
+architecture, and config digest. It rejects a manifest whose aggregate declared
+entry bytes exceed the replay budget, then replays every auction and compares
+canonical expected solutions and statistics.
+The emitted replay report contains deterministic corpus and result digests plus
+both current and recorded Go/platform identity; two runs over the same accepted
+corpus on the pinned toolchain and platform produce identical report bytes.
 
 Unknown files, missing files, symlinks, oversized files, malformed JSON,
 duplicate keys, source/config/toolchain mismatch, or a changed replay result all
