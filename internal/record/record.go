@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	AuctionRecordSchema      = "aladdin-shadow-auction-record/v1"
+	AuctionRecordSchema      = "aladdin-shadow-auction-record/v2"
 	NotificationRecordSchema = "aladdin-shadow-notification-record/v1"
 )
 
@@ -30,6 +30,7 @@ type Recorder struct {
 	auctions *os.File
 	notifs   *os.File
 	now      func() time.Time
+	identity ReplayIdentity
 
 	// KeepAuctions stores the complete auction payload for offline replay. It
 	// can include order signatures and consumes substantial disk space, so it
@@ -38,30 +39,18 @@ type Recorder struct {
 }
 
 func New(dir string, keepAuctions bool) (*Recorder, error) {
-	if dir == "" {
-		return nil, errors.New("record directory is empty")
-	}
-	if err := os.MkdirAll(dir, 0o750); err != nil {
-		return nil, fmt.Errorf("create record directory: %w", err)
-	}
-	if err := os.Chmod(dir, 0o750); err != nil {
-		return nil, fmt.Errorf("secure record directory: %w", err)
-	}
-	return &Recorder{
-		dir:          dir,
-		KeepAuctions: keepAuctions,
-		now:          time.Now,
-	}, nil
+	return NewWithOptions(dir, Options{KeepAuctions: keepAuctions, Config: solve.DefaultConfig()})
 }
 
 type AuctionRecord struct {
-	Schema    string         `json:"schema"`
-	Timestamp string         `json:"ts"`
-	AuctionID string         `json:"auctionId"`
-	ElapsedMs int64          `json:"elapsedMs"`
-	Stats     solve.Stats    `json:"stats"`
-	Solutions []api.Solution `json:"solutions"`
-	Auction   *api.Auction   `json:"auction,omitempty"`
+	Schema    string          `json:"schema"`
+	Timestamp string          `json:"ts"`
+	AuctionID string          `json:"auctionId"`
+	ElapsedMs int64           `json:"elapsedMs"`
+	Stats     solve.Stats     `json:"stats"`
+	Solutions []api.Solution  `json:"solutions"`
+	Auction   *api.Auction    `json:"auction,omitempty"`
+	Identity  *ReplayIdentity `json:"identity,omitempty"`
 }
 
 func (r *Recorder) Auction(id string, auction *api.Auction, result solve.Result, elapsed time.Duration) error {
@@ -76,6 +65,8 @@ func (r *Recorder) Auction(id string, auction *api.Auction, result solve.Result,
 	}
 	if r.KeepAuctions {
 		record.Auction = auction
+		identity := r.identity
+		record.Identity = &identity
 	}
 	data, err := json.Marshal(record)
 	if err != nil {

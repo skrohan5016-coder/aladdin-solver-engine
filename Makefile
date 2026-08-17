@@ -1,9 +1,13 @@
-.PHONY: build test race lint contract ci hooks run report clean
+.PHONY: build test race lint contract ci hooks run report pack-corpus replay-corpus clean
+
+COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null || printf unknown)
+LDFLAGS = -s -w -X github.com/skrohan5016-coder/aladdin-solver-engine/internal/buildinfo.Commit=$(COMMIT)
 
 build:
-	go build -trimpath -ldflags="-s -w" -o bin/solver ./cmd/solver
-	go build -trimpath -ldflags="-s -w" -o bin/report ./cmd/report
-	go build -trimpath -ldflags="-s -w" -o bin/contractcheck ./cmd/contractcheck
+	go build -trimpath -ldflags="$(LDFLAGS)" -o bin/solver ./cmd/solver
+	go build -trimpath -ldflags="$(LDFLAGS)" -o bin/report ./cmd/report
+	go build -trimpath -ldflags="$(LDFLAGS)" -o bin/replay ./cmd/replay
+	go build -trimpath -ldflags="$(LDFLAGS)" -o bin/contractcheck ./cmd/contractcheck
 
 test:
 	go test ./...
@@ -32,6 +36,17 @@ run: build
 
 report: build
 	./bin/report -dir ./data
+
+# Usage: make pack-corpus RECORDS='./data/auctions-*.jsonl' CORPUS=./private-corpus
+pack-corpus: build
+	test -n "$(RECORDS)"
+	test -n "$(CORPUS)"
+	./bin/replay pack -records "$(RECORDS)" -out "$(CORPUS)" -source-commit "$(COMMIT)"
+
+# Usage: make replay-corpus CORPUS=./private-corpus
+replay-corpus: build
+	test -n "$(CORPUS)"
+	./bin/replay verify -dir "$(CORPUS)" -source-commit "$(COMMIT)"
 
 clean:
 	rm -rf bin/

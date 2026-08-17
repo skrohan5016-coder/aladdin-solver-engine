@@ -14,7 +14,11 @@ import (
 
 func TestRecorderWritesVersionedPrivateEvidence(t *testing.T) {
 	dir := t.TempDir()
-	recorder, err := New(dir, true)
+	recorder, err := NewWithOptions(dir, Options{
+		KeepAuctions: true,
+		Config:       solve.DefaultConfig(),
+		EngineCommit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,8 +59,11 @@ func TestRecorderWritesVersionedPrivateEvidence(t *testing.T) {
 	if err := json.Unmarshal(auctionData, &auctionRecord); err != nil {
 		t.Fatal(err)
 	}
-	if auctionRecord.Schema != AuctionRecordSchema || auctionRecord.Auction == nil {
+	if auctionRecord.Schema != AuctionRecordSchema || auctionRecord.Auction == nil || auctionRecord.Identity == nil {
 		t.Fatalf("unexpected auction record: %+v", auctionRecord)
+	}
+	if auctionRecord.Identity.Engine.Commit != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" || auctionRecord.Identity.ConfigSHA256 == "" {
+		t.Fatalf("missing replay identity: %+v", auctionRecord.Identity)
 	}
 
 	notificationPath := filepath.Join(dir, "notifications-2026-08-16.jsonl")

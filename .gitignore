@@ -10,7 +10,12 @@ config.local.*
 /bin/
 solver
 report
+replay
 contractcheck
+
+# Private sealed replay corpora
+/corpora/
+/private-corpus/
 
 # Python helper caches
 __pycache__/

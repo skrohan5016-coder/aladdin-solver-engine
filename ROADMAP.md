@@ -41,7 +41,7 @@ Exit gate:
 
 ## Phase 1 — Continuously verify the CoW wire contract
 
-Status: implementation and fresh acceptance review complete on PR #3; exact-head approval remains before landing.
+Status: accepted and squash-merged as `b6d5f1518eb19798921521d54c8bd9a4c1d6ecd8`.
 
 Foundation already delivered in Phase 0:
 
@@ -72,6 +72,8 @@ Exit gate:
   exact SHA for landing.
 
 ## Phase 2 — Build a reproducible offline replay corpus
+
+Status: active on `agent/phase2-offline-replay-v1`.
 
 Deliverables:
 

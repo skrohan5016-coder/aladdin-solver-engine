@@ -64,13 +64,7 @@ type Result struct {
 // Solve produces solutions for an auction. It never signs, submits, or touches
 // funds; it returns proposed settlements only.
 func Solve(ctx context.Context, auction *api.Auction, cfg Config) Result {
-	defaults := DefaultConfig()
-	if cfg.MaxOrders <= 0 {
-		cfg.MaxOrders = defaults.MaxOrders
-	}
-	if cfg.MaxPools <= 0 {
-		cfg.MaxPools = defaults.MaxPools
-	}
+	cfg = ResolveConfig(cfg)
 
 	result := Result{}
 	pools, skipped := BuildPoolsContext(ctx, auction.Liquidity, cfg.MaxPools)
